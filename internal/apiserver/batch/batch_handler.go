@@ -37,6 +37,7 @@ import (
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/clientset"
 	ucom "github.com/llm-d/llm-d-batch-gateway/internal/util/com"
+	"github.com/llm-d/llm-d-batch-gateway/internal/util/failpoint"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/logging"
 	uotel "github.com/llm-d/llm-d-batch-gateway/internal/util/otel"
 )
@@ -218,6 +219,8 @@ func (c *BatchAPIHandler) CreateBatch(w http.ResponseWriter, r *http.Request) {
 		common.WriteInternalServerError(w, r)
 		return
 	}
+
+	failpoint.Inject("apiserver/after-batch-dbstore")
 
 	common.WriteJSONResponse(w, r, http.StatusOK, batch)
 }
@@ -473,6 +476,7 @@ func (c *BatchAPIHandler) CancelBatch(w http.ResponseWriter, r *http.Request) {
 			common.WriteInternalServerError(w, r)
 			return
 		}
+		failpoint.Inject("apiserver/after-cancel-pqdelete")
 		common.WriteJSONResponse(w, r, http.StatusOK, freshBatch)
 		return
 	}
@@ -501,6 +505,8 @@ func (c *BatchAPIHandler) CancelBatch(w http.ResponseWriter, r *http.Request) {
 		common.WriteInternalServerError(w, r)
 		return
 	}
+
+	failpoint.Inject("apiserver/after-cancel-dbupdate")
 
 	// Send the cancel event *after* DB update succeeds.
 	event := []api.BatchEvent{
