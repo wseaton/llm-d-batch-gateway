@@ -28,7 +28,8 @@ import (
 // IsJobRunnable checks if the job is in runnable status
 func IsJobRunnable(job *openai.Batch) bool {
 	return job.Status == openai.BatchStatusValidating ||
-		job.Status == openai.BatchStatusInProgress
+		job.Status == openai.BatchStatusInProgress ||
+		job.Status == openai.BatchStatusFinalizing
 }
 
 // IsJobExpired checks if the job is expired

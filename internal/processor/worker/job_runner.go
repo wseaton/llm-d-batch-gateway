@@ -192,15 +192,18 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 		return
 	}
 
-	// transition to in_progress before executing requests
-	if err := params.updater.UpdatePersistentStatus(ctx, params.jobItem, openai.BatchStatusInProgress, nil, nil); err != nil {
-		logger.Error(err, "Failed to update status to in_progress")
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "status transition failed")
-		if failErr := p.handleFailed(ctx, params.updater, params.jobItem, nil, params.jobInfo); failErr != nil {
-			logger.Error(failErr, "Failed to handle failed event")
+	// transition to in_progress before executing requests; a re-enqueued
+	// finalizing job is already past in_progress and must not regress
+	if params.jobInfo.BatchJob.Status != openai.BatchStatusFinalizing {
+		if err := params.updater.UpdatePersistentStatus(ctx, params.jobItem, openai.BatchStatusInProgress, nil, nil); err != nil {
+			logger.Error(err, "Failed to update status to in_progress")
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "status transition failed")
+			if failErr := p.handleFailed(ctx, params.updater, params.jobItem, nil, params.jobInfo); failErr != nil {
+				logger.Error(failErr, "Failed to handle failed event")
+			}
+			return
 		}
-		return
 	}
 	transitionedToInProgress = true
 

@@ -254,7 +254,7 @@ func (r *Reconciler) triageOrphan(ctx context.Context, job *db.BatchItem, result
 		if sloExpired {
 			ok = r.transitionOrphan(ctx, job, &statusInfo, openai.BatchStatusExpired, result, logger)
 		} else {
-			ok = r.transitionOrphan(ctx, job, &statusInfo, openai.BatchStatusFailed, result, logger)
+			ok = r.reEnqueueOrphan(ctx, job, result, logger)
 		}
 
 	default:

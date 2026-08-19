@@ -26,7 +26,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -62,25 +61,23 @@ type TableDescriptor interface {
 }
 
 // pgCore contains the shared state and SQL logic for all PostgreSQL clients.
+// It borrows the component's shared Pool and never closes it.
 type pgCore struct {
-	pool      pgxPool
-	desc      TableDescriptor
-	closeOnce sync.Once
+	pool pgxPool
+	desc TableDescriptor
 }
 
-func newPgCore(ctx context.Context, config *PostgreSQLConfig, tableDescriptor TableDescriptor) (*pgCore, error) {
-	pool, err := newPool(ctx, config)
-	if err != nil {
-		return nil, err
+func newPgCore(ctx context.Context, pool *Pool, tableDescriptor TableDescriptor) (*pgCore, error) {
+	if pool == nil {
+		return nil, fmt.Errorf("pool is nil")
 	}
 
 	pgCore := &pgCore{
-		pool: pool,
+		pool: pool.pool,
 		desc: tableDescriptor,
 	}
 
 	if err := pgCore.ensureSchema(ctx); err != nil {
-		pool.Close()
 		return nil, err
 	}
 
@@ -475,13 +472,4 @@ func (c *pgCore) ensureSchema(ctx context.Context) error {
 		}
 	}
 	return err
-}
-
-func (c *pgCore) close() error {
-	c.closeOnce.Do(func() {
-		if c.pool != nil {
-			c.pool.Close()
-		}
-	})
-	return nil
 }

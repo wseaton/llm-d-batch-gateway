@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"sync"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/go-logr/logr"
 	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
+	filesapi "github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/batchctx"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/metrics"
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/converter"
@@ -54,7 +56,7 @@ func (p *Processor) uploadFileAndStoreFileRecord(
 	var err error
 	var attrKey string
 
-	fileID := ucom.NewFileID()
+	fileID := ucom.FileIDForBatchArtifact(jobInfo.JobID, string(fileType))
 
 	if fileType == metrics.FileTypeOutput {
 		fileName = jobOutputStorageName(jobInfo.JobID)
@@ -174,6 +176,7 @@ func (p *Processor) finalizeJob(
 			return fmt.Errorf("cancelled status write failed: %w", errFinalizeFailedOver)
 		}
 		setRequestCountAttrs(ctx, requestCounts)
+		p.cleanupResultRows(ioCtx, dbJob.ID)
 		return batchctx.ErrCancelled
 	}
 
@@ -187,9 +190,22 @@ func (p *Processor) finalizeJob(
 	}
 
 	setRequestCountAttrs(ctx, requestCounts)
+	p.cleanupResultRows(ioCtx, dbJob.ID)
 
 	logger.V(logging.INFO).Info("Finalization completed", "outputFileID", outputFileID, "errorFileID", errorFileID)
 	return nil
+}
+
+// cleanupResultRows drops the batch's durable scratch rows once a terminal
+// status is written. Best-effort: leftover rows only cost storage until an
+// external sweep reclaims them.
+func (p *Processor) cleanupResultRows(ctx context.Context, batchID string) {
+	if p.resultDB == nil {
+		return
+	}
+	if err := p.resultDB.ResultDelete(ctx, batchID); err != nil {
+		logr.FromContextOrDiscard(ctx).Error(err, "Failed to delete result rows", "batchId", batchID)
+	}
 }
 
 // uploadOutputFile uploads the local output file to shared storage.
@@ -253,11 +269,37 @@ func (p *Processor) uploadJobFile(
 	}
 
 	fileMeta, err := p.files.storage.Store(ctx, fileName, folderName, 0, 0, f)
+	if errors.Is(err, filesapi.ErrFileExists) {
+		return p.replaceBlob(ctx, f, fileName, folderName)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("failed to upload file %s: %w", fileName, err)
 	}
 
 	return fileMeta.Size, nil
+}
+
+// replaceBlob deletes the blob a previous attempt left under the same
+// deterministic name and re-uploads the local file. Attempts are not
+// byte-reproducible (fresh request IDs, replay order), so no identity check
+// can safely adopt the existing blob; the just-assembled local file is the
+// artifact.
+func (p *Processor) replaceBlob(
+	ctx context.Context,
+	f *os.File,
+	fileName, folderName string,
+) (int64, error) {
+	if err := p.files.storage.Delete(ctx, fileName, folderName); err != nil {
+		return 0, fmt.Errorf("delete stale blob %s: %w", fileName, err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("rewind %s for re-upload: %w", fileName, err)
+	}
+	meta, err := p.files.storage.Store(ctx, fileName, folderName, 0, 0, f)
+	if err != nil {
+		return 0, fmt.Errorf("replace blob %s: %w", fileName, err)
+	}
+	return meta.Size, nil
 }
 
 // storeFileRecord creates a file metadata record in the database.
@@ -294,7 +336,15 @@ func (p *Processor) storeFileRecord(
 	}
 
 	if err := p.files.db.DBStore(ctx, fileItem); err != nil {
-		return fmt.Errorf("failed to store file record: %w", err)
+		// A record left by a previous finalize attempt makes the store fail;
+		// file IDs are deterministic per batch, so replace it wholesale to
+		// keep the recorded bytes consistent with the just-uploaded blob.
+		if _, delErr := p.files.db.DBDelete(ctx, []string{fileID}); delErr != nil {
+			return fmt.Errorf("failed to store file record: %w", err)
+		}
+		if retryErr := p.files.db.DBStore(ctx, fileItem); retryErr != nil {
+			return fmt.Errorf("failed to store file record after replace: %w", retryErr)
+		}
 	}
 	return nil
 }

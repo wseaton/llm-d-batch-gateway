@@ -49,13 +49,14 @@ type PostgresFileDBClient struct {
 
 var _ api.FileDBClient = (*PostgresFileDBClient)(nil)
 
-// NewPostgresFileDBClient creates a new PostgreSQL file database client.
-func NewPostgresFileDBClient(ctx context.Context, config *PostgreSQLConfig) (*PostgresFileDBClient, error) {
+// NewPostgresFileDBClient creates a new PostgreSQL file database client on
+// the shared pool.
+func NewPostgresFileDBClient(ctx context.Context, pool *Pool) (*PostgresFileDBClient, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	pgCore, err := newPgCore(ctx, config, fileTableDescriptor{})
+	pgCore, err := newPgCore(ctx, pool, fileTableDescriptor{})
 	if err != nil {
 		return nil, err
 	}
@@ -64,8 +65,9 @@ func NewPostgresFileDBClient(ctx context.Context, config *PostgreSQLConfig) (*Po
 	return &PostgresFileDBClient{pgCore}, nil
 }
 
+// Close is a no-op; the shared Pool owns the connections.
 func (c *PostgresFileDBClient) Close() error {
-	return c.close()
+	return nil
 }
 
 func (c *PostgresFileDBClient) DBStore(ctx context.Context, item *api.FileItem) (err error) {

@@ -166,6 +166,10 @@ func (d *dbStoreErrFileClient) DBStore(_ context.Context, _ *db.FileItem) error 
 	return d.err
 }
 
+func (d *dbStoreErrFileClient) DBDelete(_ context.Context, _ []string) ([]string, error) {
+	return nil, d.err
+}
+
 // ---------------------------------------------------------------------------
 // Spy wrappers
 // ---------------------------------------------------------------------------
@@ -747,4 +751,74 @@ func (c *countingInFlightClient) InFlightGetAll(ctx context.Context) (map[string
 
 func (c *countingInFlightClient) Close() error {
 	return c.inner.Close()
+}
+
+// dbReplaceFileClient fails DBStore while a previous attempt's record exists
+// and accepts it after DBDelete removes that record.
+type dbReplaceFileClient struct {
+	db.FileDBClient
+	deleted bool
+	stored  *db.FileItem
+}
+
+func (d *dbReplaceFileClient) DBStore(_ context.Context, item *db.FileItem) error {
+	if !d.deleted {
+		return errors.New("duplicate key")
+	}
+	d.stored = item
+	return nil
+}
+
+func (d *dbReplaceFileClient) DBDelete(_ context.Context, ids []string) ([]string, error) {
+	d.deleted = true
+	return ids, nil
+}
+
+// existingBlobFilesClient holds one pre-existing blob, modeling an artifact
+// left by a previous finalize attempt under the same deterministic name.
+// Store rejects while the blob exists; Delete removes it.
+type existingBlobFilesClient struct {
+	deleted bool
+	stores  int
+}
+
+func (e *existingBlobFilesClient) Store(_ context.Context, name, _ string, _, _ int64, r io.Reader) (*filesapi.BatchFileMetadata, error) {
+	if !e.deleted {
+		return nil, fmt.Errorf("%w: %s", filesapi.ErrFileExists, name)
+	}
+	e.stores++
+	n, err := io.Copy(io.Discard, r)
+	if err != nil {
+		return nil, err
+	}
+	return &filesapi.BatchFileMetadata{Size: n}, nil
+}
+func (e *existingBlobFilesClient) Retrieve(_ context.Context, _, _ string) (io.ReadCloser, *filesapi.BatchFileMetadata, error) {
+	return nil, nil, errors.New("not implemented")
+}
+func (e *existingBlobFilesClient) List(_ context.Context, _ string) ([]filesapi.BatchFileMetadata, error) {
+	return nil, nil
+}
+func (e *existingBlobFilesClient) Delete(_ context.Context, _, _ string) error {
+	e.deleted = true
+	return nil
+}
+func (e *existingBlobFilesClient) GetContext(p context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithCancel(p)
+}
+func (e *existingBlobFilesClient) Close() error { return nil }
+
+// ctxCapturingResultDB records the context liveness of each ResultStore call.
+type ctxCapturingResultDB struct {
+	db.ResultDBClient
+	storedWithLiveCtx []bool
+}
+
+func (c *ctxCapturingResultDB) ResultStore(ctx context.Context, _ *db.ResultRow) error {
+	c.storedWithLiveCtx = append(c.storedWithLiveCtx, ctx.Err() == nil)
+	return nil
+}
+
+func (c *ctxCapturingResultDB) ResultGetAll(_ context.Context, _ string) ([]*db.ResultRow, error) {
+	return nil, nil
 }

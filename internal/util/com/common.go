@@ -49,6 +49,16 @@ func NewFileID() string {
 	return fmt.Sprintf("file_%s", uuid.NewString())
 }
 
+// batchArtifactNamespace scopes deterministic batch-artifact file IDs.
+var batchArtifactNamespace = uuid.NewSHA1(uuid.NameSpaceURL, []byte("llm-d/batch-gateway/batch-artifact"))
+
+// FileIDForBatchArtifact derives the file ID for a batch's output or error
+// artifact from the batch ID, so every finalize attempt converges on the
+// same ID and storage key.
+func FileIDForBatchArtifact(batchID, kind string) string {
+	return fmt.Sprintf("file_%s", uuid.NewSHA1(batchArtifactNamespace, []byte(batchID+"/"+kind)))
+}
+
 // NewBatchID generates a new unique batch ID in the format "batch_<uuid>",
 // matching the OpenAI Batch API convention.
 func NewBatchID() string {

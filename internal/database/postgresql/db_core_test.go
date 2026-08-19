@@ -383,10 +383,14 @@ func TestCoreDelete_DBFailure(t *testing.T) {
 // --- close ---
 
 func TestClose(t *testing.T) {
-	core, mock := newTestCore(t)
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("failed to create pgxmock pool: %v", err)
+	}
 	mock.ExpectClose()
 
-	if err := core.close(); err != nil {
+	pool := &Pool{pool: mock}
+	if err := pool.Close(); err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 }
