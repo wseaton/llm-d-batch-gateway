@@ -61,13 +61,14 @@ type PostgresBatchDBClient struct {
 
 var _ api.BatchDBClient = (*PostgresBatchDBClient)(nil)
 
-// NewPostgresBatchDBClient creates a new PostgreSQL batch database client.
-func NewPostgresBatchDBClient(ctx context.Context, config *PostgreSQLConfig) (*PostgresBatchDBClient, error) {
+// NewPostgresBatchDBClient creates a new PostgreSQL batch database client on
+// the shared pool.
+func NewPostgresBatchDBClient(ctx context.Context, pool *Pool) (*PostgresBatchDBClient, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	pgCore, err := newPgCore(ctx, config, batchDescriptor{})
+	pgCore, err := newPgCore(ctx, pool, batchDescriptor{})
 	if err != nil {
 		return nil, err
 	}
@@ -76,8 +77,9 @@ func NewPostgresBatchDBClient(ctx context.Context, config *PostgreSQLConfig) (*P
 	return &PostgresBatchDBClient{pgCore}, nil
 }
 
+// Close is a no-op; the shared Pool owns the connections.
 func (c *PostgresBatchDBClient) Close() error {
-	return c.close()
+	return nil
 }
 
 func (c *PostgresBatchDBClient) DBStore(ctx context.Context, item *api.BatchItem) (err error) {
