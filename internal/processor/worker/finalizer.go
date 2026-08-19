@@ -27,6 +27,7 @@ import (
 
 	"github.com/go-logr/logr"
 	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
+	filesapi "github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/batchctx"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/metrics"
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/converter"
@@ -54,7 +55,7 @@ func (p *Processor) uploadFileAndStoreFileRecord(
 	var err error
 	var attrKey string
 
-	fileID := ucom.NewFileID()
+	fileID := ucom.FileIDForBatchArtifact(jobInfo.JobID, string(fileType))
 
 	if fileType == metrics.FileTypeOutput {
 		fileName = jobOutputStorageName(jobInfo.JobID)
@@ -267,6 +268,12 @@ func (p *Processor) uploadJobFile(
 	}
 
 	fileMeta, err := p.files.storage.Store(ctx, fileName, folderName, 0, 0, f)
+	if errors.Is(err, filesapi.ErrFileExists) {
+		// A previous finalize attempt already stored this artifact; file
+		// names are deterministic per batch, so the existing object is this
+		// file. Same result set, same size.
+		return stat.Size(), nil
+	}
 	if err != nil {
 		return 0, fmt.Errorf("failed to upload file %s: %w", fileName, err)
 	}
@@ -308,6 +315,15 @@ func (p *Processor) storeFileRecord(
 	}
 
 	if err := p.files.db.DBStore(ctx, fileItem); err != nil {
+		// A record left by a previous finalize attempt makes the store fail;
+		// file IDs are deterministic per batch, so the existing record is
+		// this artifact and the attempt converges on it.
+		existing, _, _, getErr := p.files.db.DBGet(ctx, &db.FileQuery{
+			BaseQuery: db.BaseQuery{IDs: []string{fileID}, TenantID: tenantID},
+		}, false, 0, 1)
+		if getErr == nil && len(existing) == 1 {
+			return nil
+		}
 		return fmt.Errorf("failed to store file record: %w", err)
 	}
 	return nil

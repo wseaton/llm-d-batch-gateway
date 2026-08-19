@@ -166,6 +166,10 @@ func (d *dbStoreErrFileClient) DBStore(_ context.Context, _ *db.FileItem) error 
 	return d.err
 }
 
+func (d *dbStoreErrFileClient) DBGet(_ context.Context, _ *db.FileQuery, _ bool, _, _ int) ([]*db.FileItem, int, bool, error) {
+	return nil, 0, false, nil
+}
+
 // ---------------------------------------------------------------------------
 // Spy wrappers
 // ---------------------------------------------------------------------------
@@ -748,3 +752,37 @@ func (c *countingInFlightClient) InFlightGetAll(ctx context.Context) (map[string
 func (c *countingInFlightClient) Close() error {
 	return c.inner.Close()
 }
+
+// dbStoreConflictFileClient fails DBStore but reports the record as already
+// present, modeling a previous finalize attempt's surviving row.
+type dbStoreConflictFileClient struct {
+	db.FileDBClient
+	err error
+}
+
+func (d *dbStoreConflictFileClient) DBStore(_ context.Context, _ *db.FileItem) error {
+	return d.err
+}
+
+func (d *dbStoreConflictFileClient) DBGet(_ context.Context, q *db.FileQuery, _ bool, _, _ int) ([]*db.FileItem, int, bool, error) {
+	return []*db.FileItem{{BaseIndexes: db.BaseIndexes{ID: q.IDs[0]}}}, 0, false, nil
+}
+
+// alwaysExistsFilesClient rejects every Store with ErrFileExists, modeling a
+// blob left by a previous finalize attempt under the same deterministic name.
+type alwaysExistsFilesClient struct{}
+
+func (a *alwaysExistsFilesClient) Store(_ context.Context, name, _ string, _, _ int64, _ io.Reader) (*filesapi.BatchFileMetadata, error) {
+	return nil, fmt.Errorf("%w: %s", filesapi.ErrFileExists, name)
+}
+func (a *alwaysExistsFilesClient) Retrieve(_ context.Context, _, _ string) (io.ReadCloser, *filesapi.BatchFileMetadata, error) {
+	return nil, nil, nil
+}
+func (a *alwaysExistsFilesClient) List(_ context.Context, _ string) ([]filesapi.BatchFileMetadata, error) {
+	return nil, nil
+}
+func (a *alwaysExistsFilesClient) Delete(_ context.Context, _, _ string) error { return nil }
+func (a *alwaysExistsFilesClient) GetContext(p context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithCancel(p)
+}
+func (a *alwaysExistsFilesClient) Close() error { return nil }

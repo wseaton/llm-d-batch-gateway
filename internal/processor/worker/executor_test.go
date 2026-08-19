@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/clientset"
+	ucom "github.com/llm-d/llm-d-batch-gateway/internal/util/com"
 
 	httpclient "github.com/llm-d/llm-d-batch-gateway/pkg/clients/http"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
@@ -1703,4 +1705,52 @@ func gatherHistogramSampleCount(t *testing.T, name string, labels map[string]str
 		return 0
 	}
 	return m.GetHistogram().GetSampleCount()
+}
+
+func TestStoreFileRecord_ExistingRecordConverges(t *testing.T) {
+	cfg := config.NewConfig()
+	conflictDB := &dbStoreConflictFileClient{err: errors.New("duplicate key")}
+	p := mustNewProcessor(t, cfg, &clientset.Clientset{FileDB: conflictDB})
+
+	err := p.storeFileRecord(testLoggerCtx(t), "file_x", "output.jsonl", "tenant-1", 100, db.Tags{})
+	if err != nil {
+		t.Fatalf("expected existing record to count as success, got %v", err)
+	}
+}
+
+func TestFileIDForBatchArtifact(t *testing.T) {
+	a := ucom.FileIDForBatchArtifact("batch_1", "output")
+	if a != ucom.FileIDForBatchArtifact("batch_1", "output") {
+		t.Fatal("same batch and kind must derive the same file ID")
+	}
+	if a == ucom.FileIDForBatchArtifact("batch_1", "error") {
+		t.Fatal("different kinds must derive different file IDs")
+	}
+	if a == ucom.FileIDForBatchArtifact("batch_2", "output") {
+		t.Fatal("different batches must derive different file IDs")
+	}
+	if !strings.HasPrefix(a, "file_") {
+		t.Fatalf("derived ID %q must keep the file_ prefix", a)
+	}
+}
+
+func TestUploadJobFile_ExistingBlobConverges(t *testing.T) {
+	cfg := config.NewConfig()
+	store := &alwaysExistsFilesClient{}
+	p := mustNewProcessor(t, cfg, &clientset.Clientset{File: store})
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "output.jsonl")
+	content := []byte("{\"custom_id\":\"c-1\"}\n")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	size, err := p.uploadJobFile(testLoggerCtx(t), path, "file_x.jsonl", "tenant-1")
+	if err != nil {
+		t.Fatalf("expected existing blob to count as success, got %v", err)
+	}
+	if size != int64(len(content)) {
+		t.Fatalf("size = %d, want %d (local file size)", size, len(content))
+	}
 }
