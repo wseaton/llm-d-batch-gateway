@@ -250,18 +250,11 @@ func (r *Reconciler) triageOrphan(ctx context.Context, job *db.BatchItem, result
 			ok = r.reEnqueueOrphan(ctx, job, result, logger)
 		}
 
-	case openai.BatchStatusInProgress:
+	case openai.BatchStatusInProgress, openai.BatchStatusFinalizing:
 		if sloExpired {
 			ok = r.transitionOrphan(ctx, job, &statusInfo, openai.BatchStatusExpired, result, logger)
 		} else {
 			ok = r.reEnqueueOrphan(ctx, job, result, logger)
-		}
-
-	case openai.BatchStatusFinalizing:
-		if sloExpired {
-			ok = r.transitionOrphan(ctx, job, &statusInfo, openai.BatchStatusExpired, result, logger)
-		} else {
-			ok = r.transitionOrphan(ctx, job, &statusInfo, openai.BatchStatusFailed, result, logger)
 		}
 
 	default:

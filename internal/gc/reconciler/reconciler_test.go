@@ -202,7 +202,7 @@ func TestTriageOrphan(t *testing.T) {
 		}
 	})
 
-	t.Run("finalizing with future SLO transitions to failed", func(t *testing.T) {
+	t.Run("finalizing with future SLO is re-enqueued", func(t *testing.T) {
 		batchDB := newMockBatchDB()
 		queue := mock.NewMockBatchPriorityQueueClient()
 		inflight := mock.NewMockInFlightClient()
@@ -214,8 +214,14 @@ func TestTriageOrphan(t *testing.T) {
 		r.run(ctx)
 
 		result := <-resultCh
-		if result.Failed != 1 {
-			t.Errorf("expected 1 failed, got %d", result.Failed)
+		if result.ReEnqueued != 1 {
+			t.Errorf("expected 1 re-enqueued, got %d", result.ReEnqueued)
+		}
+		assertJobStatus(t, batchDB, "job-1", openai.BatchStatusFinalizing)
+
+		queuedIDs, _ := queue.PQGetIDs(ctx)
+		if !queuedIDs["job-1"] {
+			t.Error("expected job-1 to be in queue after re-enqueue")
 		}
 	})
 }
