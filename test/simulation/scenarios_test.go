@@ -113,7 +113,10 @@ func TestF3TerminalOverwrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upload input file: %v", err)
 	}
-	batch, err := client.createBatch(fileID, "24h")
+	// A 5s completion window expires the SLO during the held-open write, so
+	// the reconciler terminalizes the stale-heartbeat orphan (expired)
+	// rather than re-enqueueing it for resume.
+	batch, err := client.createBatch(fileID, "5s")
 	if err != nil {
 		t.Fatalf("create batch: %v", err)
 	}
@@ -123,8 +126,9 @@ func TestF3TerminalOverwrite(t *testing.T) {
 	tl := observe(ctx, client, batch.ID, h.rec)
 
 	// Expected sequence today: the job executes, the processor sleeps 20s
-	// before its completed write, the reconciler CASes the stale-heartbeat
-	// job to failed during the sleep, and the processor then overwrites it.
+	// before its completed write, the reconciler terminalizes the expired
+	// stale-heartbeat job during the sleep, and the processor then
+	// overwrites the terminal state.
 	final, _ := waitForStatus(client, batch.ID, sleep+4*params().ReconcilerInterval+30*time.Second, openai.BatchStatusCompleted)
 
 	// Give the observer a final polling cycle past the last transition.
@@ -411,10 +415,20 @@ func TestF5OrphanedBlob(t *testing.T) {
 	defer cancel()
 	tl := observe(ctx, client, batch.ID, h.rec)
 
-	// The processor dies inside finalization; the reconciler terminalizes
-	// the orphaned finalizing job.
+	// The failpoint kills the processor inside finalization. Disarm it for
+	// the replacement: the crash models a transient pod loss, not a bug
+	// that recurs on every finalize attempt.
+	if _, ok := waitForStatus(client, batch.ID, 60*time.Second, openai.BatchStatusFinalizing); !ok {
+		t.Fatal("batch never reached finalizing")
+	}
+	time.Sleep(2 * time.Second)
+	h.setEnv("PROCESSOR_FAILPOINTS", "")
+	h.restart("processor")
+
+	// The reconciler re-enqueues the orphaned finalizing job and the
+	// replacement re-finalizes it under the same deterministic file IDs.
 	final, terminal := waitForStatus(client, batch.ID, 2*time.Minute,
-		openai.BatchStatusFailed, openai.BatchStatusExpired)
+		openai.BatchStatusFailed, openai.BatchStatusExpired, openai.BatchStatusCompleted)
 	if !terminal {
 		t.Fatalf("batch never terminalized; last status %s", final.Status)
 	}
@@ -462,6 +476,16 @@ func TestF6FinalizationStrand(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	tl := observe(ctx, client, batch.ID, h.rec)
+
+	// The failpoint kills the processor after the file records land. Disarm
+	// both failpoints for the replacement: the crash models a transient pod
+	// loss, not a bug that recurs on every finalize attempt.
+	if _, ok := waitForStatus(client, batch.ID, 60*time.Second, openai.BatchStatusFinalizing); !ok {
+		t.Fatal("batch never reached finalizing")
+	}
+	time.Sleep(2 * time.Second)
+	h.setEnv("PROCESSOR_FAILPOINTS", "")
+	h.restart("processor")
 
 	final, terminal := waitForStatus(client, batch.ID, 2*time.Minute,
 		openai.BatchStatusFailed, openai.BatchStatusExpired, openai.BatchStatusCompleted)
