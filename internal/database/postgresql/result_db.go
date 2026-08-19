@@ -47,13 +47,14 @@ type PostgresResultDBClient struct {
 
 var _ api.ResultDBClient = (*PostgresResultDBClient)(nil)
 
-// NewPostgresResultDBClient creates a new PostgreSQL result database client.
-func NewPostgresResultDBClient(ctx context.Context, config *PostgreSQLConfig) (*PostgresResultDBClient, error) {
+// NewPostgresResultDBClient creates a new PostgreSQL result database client
+// on the shared pool.
+func NewPostgresResultDBClient(ctx context.Context, pool *Pool) (*PostgresResultDBClient, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	core, err := newPgCore(ctx, config, resultTableDescriptor{})
+	core, err := newPgCore(ctx, pool, resultTableDescriptor{})
 	if err != nil {
 		return nil, err
 	}
@@ -62,8 +63,9 @@ func NewPostgresResultDBClient(ctx context.Context, config *PostgreSQLConfig) (*
 	return &PostgresResultDBClient{core: core}, nil
 }
 
+// Close is a no-op; the shared Pool owns the connections.
 func (c *PostgresResultDBClient) Close() error {
-	return c.core.close()
+	return nil
 }
 
 func (c *PostgresResultDBClient) ResultStore(ctx context.Context, row *api.ResultRow) error {

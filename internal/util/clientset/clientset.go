@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 
 	"github.com/go-logr/logr"
@@ -52,6 +53,10 @@ type Clientset struct {
 	InFlight       dbapi.InFlightClient
 	Inference      *inference.GatewayResolver
 	AsyncInference *inference.AsyncGatewayResolver
+
+	// dbPool is the shared connection pool behind the DB clients, when the
+	// backend uses one; closed after the clients in Close.
+	dbPool io.Closer
 }
 
 // NewFSFileClient creates a filesystem-based file storage client.
@@ -99,12 +104,17 @@ type DBClients struct {
 	Batch  dbapi.BatchDBClient
 	File   dbapi.FileDBClient
 	Result dbapi.ResultDBClient // nil when the backend does not support it
+
+	// pool is the shared connection pool behind the clients, when the
+	// backend uses one; the Clientset closes it after the clients.
+	pool io.Closer
 }
 
 func (d *DBClients) install(cs *Clientset) {
 	cs.BatchDB = d.Batch
 	cs.FileDB = d.File
 	cs.ResultDB = d.Result
+	cs.dbPool = d.pool
 }
 
 // NewRedisDBClients creates Redis-backed batch and file database clients.
@@ -146,20 +156,24 @@ func NewPostgreSQLDBClients(ctx context.Context, cfg *postgresql.PostgreSQLConfi
 		}
 		cfg.Url = postgreSQLURL
 	}
-	batchDB, err := postgresql.NewPostgresBatchDBClient(ctx, cfg)
+	pool, err := postgresql.NewPool(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create postgresql batch-db client: %w", err)
+		return nil, fmt.Errorf("failed to create postgresql pool: %w", err)
 	}
-	fileDB, err := postgresql.NewPostgresFileDBClient(ctx, cfg)
+	batchDB, err := postgresql.NewPostgresBatchDBClient(ctx, pool)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create postgresql file-db client: %w", err)
+		return nil, errors.Join(fmt.Errorf("failed to create postgresql batch-db client: %w", err), pool.Close())
 	}
-	resultDB, err := postgresql.NewPostgresResultDBClient(ctx, cfg)
+	fileDB, err := postgresql.NewPostgresFileDBClient(ctx, pool)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create postgresql result-db client: %w", err)
+		return nil, errors.Join(fmt.Errorf("failed to create postgresql file-db client: %w", err), pool.Close())
+	}
+	resultDB, err := postgresql.NewPostgresResultDBClient(ctx, pool)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("failed to create postgresql result-db client: %w", err), pool.Close())
 	}
 	logr.FromContextOrDiscard(ctx).Info("PostgreSQL-based database client created")
-	return &DBClients{Batch: batchDB, File: fileDB, Result: resultDB}, nil
+	return &DBClients{Batch: batchDB, File: fileDB, Result: resultDB, pool: pool}, nil
 }
 
 // Option configures which clients NewClientset creates.
@@ -348,6 +362,16 @@ func (cs *Clientset) Close() error {
 	}
 	if cs.FileDB != nil {
 		if err := cs.FileDB.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if cs.ResultDB != nil {
+		if err := cs.ResultDB.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if cs.dbPool != nil {
+		if err := cs.dbPool.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
