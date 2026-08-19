@@ -21,6 +21,7 @@ import (
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/batchctx"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/config"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/metrics"
+	"github.com/llm-d/llm-d-batch-gateway/internal/processor/pipeline"
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/clientset"
@@ -1707,14 +1708,20 @@ func gatherHistogramSampleCount(t *testing.T, name string, labels map[string]str
 	return m.GetHistogram().GetSampleCount()
 }
 
-func TestStoreFileRecord_ExistingRecordConverges(t *testing.T) {
+func TestStoreFileRecord_ExistingRecordReplaced(t *testing.T) {
 	cfg := config.NewConfig()
-	conflictDB := &dbStoreConflictFileClient{err: errors.New("duplicate key")}
-	p := mustNewProcessor(t, cfg, &clientset.Clientset{FileDB: conflictDB})
+	fileDB := &dbReplaceFileClient{}
+	p := mustNewProcessor(t, cfg, &clientset.Clientset{FileDB: fileDB})
 
 	err := p.storeFileRecord(testLoggerCtx(t), "file_x", "output.jsonl", "tenant-1", 100, db.Tags{})
 	if err != nil {
-		t.Fatalf("expected existing record to count as success, got %v", err)
+		t.Fatalf("expected existing record to be replaced, got %v", err)
+	}
+	if fileDB.stored == nil {
+		t.Fatal("record must be re-stored after the delete")
+	}
+	if fileDB.stored.ID != "file_x" {
+		t.Fatalf("re-stored record ID = %q, want file_x", fileDB.stored.ID)
 	}
 }
 
@@ -1734,23 +1741,70 @@ func TestFileIDForBatchArtifact(t *testing.T) {
 	}
 }
 
-func TestUploadJobFile_ExistingBlobConverges(t *testing.T) {
-	cfg := config.NewConfig()
-	store := &alwaysExistsFilesClient{}
-	p := mustNewProcessor(t, cfg, &clientset.Clientset{File: store})
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "output.jsonl")
-	content := []byte("{\"custom_id\":\"c-1\"}\n")
-	if err := os.WriteFile(path, content, 0o600); err != nil {
-		t.Fatal(err)
+func TestUploadJobFile_ExistingBlob(t *testing.T) {
+	content := []byte("{\"custom_id\":\"c-1\"}\n{\"custom_id\":\"c-2\"}\n")
+	writeLocal := func(t *testing.T) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "output.jsonl")
+		if err := os.WriteFile(path, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
 	}
 
-	size, err := p.uploadJobFile(testLoggerCtx(t), path, "file_x.jsonl", "tenant-1")
+	t.Run("existing blob is deleted and re-uploaded", func(t *testing.T) {
+		store := &existingBlobFilesClient{}
+		p := mustNewProcessor(t, config.NewConfig(), &clientset.Clientset{File: store})
+
+		size, err := p.uploadJobFile(testLoggerCtx(t), writeLocal(t), "file_x.jsonl", "tenant-1")
+		if err != nil {
+			t.Fatalf("expected replacement, got %v", err)
+		}
+		if size != int64(len(content)) {
+			t.Fatalf("size = %d, want %d (full re-upload)", size, len(content))
+		}
+		if !store.deleted || store.stores != 1 {
+			t.Fatalf("must delete and re-upload once (deleted=%v stores=%d)", store.deleted, store.stores)
+		}
+	})
+}
+
+func TestSetupResultPersistence_PersistSurvivesAbort(t *testing.T) {
+	resultDB := &ctxCapturingResultDB{}
+	p := mustNewProcessor(t, config.NewConfig(), &clientset.Clientset{ResultDB: resultDB})
+
+	newFile := func(name string) *os.File {
+		f, err := os.Create(filepath.Join(t.TempDir(), name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { f.Close() })
+		return f
+	}
+	tracker := pipeline.NewProgressTracker(1, nil, "job-1", 0, testLogger(t))
+	collector := pipeline.NewResultCollector(newFile("output.jsonl"), newFile("error.jsonl"),
+		pipeline.NewPendingRequests(0), tracker, testLogger(t))
+
+	ctx, cancel := context.WithCancel(testLoggerCtx(t))
+	skip, err := p.setupResultPersistence(ctx, "job-1", collector, testLogger(t))
 	if err != nil {
-		t.Fatalf("expected existing blob to count as success, got %v", err)
+		t.Fatalf("setupResultPersistence: %v", err)
 	}
-	if size != int64(len(content)) {
-		t.Fatalf("size = %d, want %d (local file size)", size, len(content))
+	if skip != nil {
+		t.Fatalf("expected empty skip set, got %v", skip)
+	}
+
+	// Abort the job, then deliver a result: the persist call must still run
+	// on a live context so rows written during shutdown are not dropped.
+	cancel()
+	if err := collector.Receive(pipeline.ResultItem{RequestID: "r1", CustomID: "c-1"}); err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+
+	if len(resultDB.storedWithLiveCtx) != 1 {
+		t.Fatalf("persist calls = %d, want 1", len(resultDB.storedWithLiveCtx))
+	}
+	if !resultDB.storedWithLiveCtx[0] {
+		t.Fatal("persist ran with a cancelled context; rows written during shutdown would be dropped")
 	}
 }

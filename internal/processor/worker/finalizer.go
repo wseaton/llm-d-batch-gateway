@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"sync"
@@ -269,16 +270,36 @@ func (p *Processor) uploadJobFile(
 
 	fileMeta, err := p.files.storage.Store(ctx, fileName, folderName, 0, 0, f)
 	if errors.Is(err, filesapi.ErrFileExists) {
-		// A previous finalize attempt already stored this artifact; file
-		// names are deterministic per batch, so the existing object is this
-		// file. Same result set, same size.
-		return stat.Size(), nil
+		return p.replaceBlob(ctx, f, fileName, folderName)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("failed to upload file %s: %w", fileName, err)
 	}
 
 	return fileMeta.Size, nil
+}
+
+// replaceBlob deletes the blob a previous attempt left under the same
+// deterministic name and re-uploads the local file. Attempts are not
+// byte-reproducible (fresh request IDs, replay order), so no identity check
+// can safely adopt the existing blob; the just-assembled local file is the
+// artifact.
+func (p *Processor) replaceBlob(
+	ctx context.Context,
+	f *os.File,
+	fileName, folderName string,
+) (int64, error) {
+	if err := p.files.storage.Delete(ctx, fileName, folderName); err != nil {
+		return 0, fmt.Errorf("delete stale blob %s: %w", fileName, err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("rewind %s for re-upload: %w", fileName, err)
+	}
+	meta, err := p.files.storage.Store(ctx, fileName, folderName, 0, 0, f)
+	if err != nil {
+		return 0, fmt.Errorf("replace blob %s: %w", fileName, err)
+	}
+	return meta.Size, nil
 }
 
 // storeFileRecord creates a file metadata record in the database.
@@ -316,15 +337,14 @@ func (p *Processor) storeFileRecord(
 
 	if err := p.files.db.DBStore(ctx, fileItem); err != nil {
 		// A record left by a previous finalize attempt makes the store fail;
-		// file IDs are deterministic per batch, so the existing record is
-		// this artifact and the attempt converges on it.
-		existing, _, _, getErr := p.files.db.DBGet(ctx, &db.FileQuery{
-			BaseQuery: db.BaseQuery{IDs: []string{fileID}, TenantID: tenantID},
-		}, false, 0, 1)
-		if getErr == nil && len(existing) == 1 {
-			return nil
+		// file IDs are deterministic per batch, so replace it wholesale to
+		// keep the recorded bytes consistent with the just-uploaded blob.
+		if _, delErr := p.files.db.DBDelete(ctx, []string{fileID}); delErr != nil {
+			return fmt.Errorf("failed to store file record: %w", err)
 		}
-		return fmt.Errorf("failed to store file record: %w", err)
+		if retryErr := p.files.db.DBStore(ctx, fileItem); retryErr != nil {
+			return fmt.Errorf("failed to store file record after replace: %w", retryErr)
+		}
 	}
 	return nil
 }

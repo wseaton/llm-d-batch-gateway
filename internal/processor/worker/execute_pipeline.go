@@ -144,10 +144,14 @@ func (p *Processor) setupResultPersistence(
 		logger.V(logging.INFO).Info("Resumed from persisted results", "count", len(rows))
 	}
 
+	// persistCtx survives job abort: a result that reached the local file
+	// during shutdown must still land in the scratch table, or the resume
+	// re-executes it.
+	persistCtx := context.WithoutCancel(ctx)
 	collector.SetPersist(func(customID string, isError bool, line []byte) {
 		failpoint.Inject("processor/before-result-persist")
 		row := &db.ResultRow{BatchID: jobID, CustomID: customID, IsError: isError, Line: line}
-		if err := p.resultDB.ResultStore(ctx, row); err != nil {
+		if err := p.resultDB.ResultStore(persistCtx, row); err != nil {
 			logger.Error(err, "Failed to persist result row", "customId", customID)
 		}
 	})

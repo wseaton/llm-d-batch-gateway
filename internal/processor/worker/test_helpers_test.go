@@ -166,8 +166,8 @@ func (d *dbStoreErrFileClient) DBStore(_ context.Context, _ *db.FileItem) error 
 	return d.err
 }
 
-func (d *dbStoreErrFileClient) DBGet(_ context.Context, _ *db.FileQuery, _ bool, _, _ int) ([]*db.FileItem, int, bool, error) {
-	return nil, 0, false, nil
+func (d *dbStoreErrFileClient) DBDelete(_ context.Context, _ []string) ([]string, error) {
+	return nil, d.err
 }
 
 // ---------------------------------------------------------------------------
@@ -753,36 +753,72 @@ func (c *countingInFlightClient) Close() error {
 	return c.inner.Close()
 }
 
-// dbStoreConflictFileClient fails DBStore but reports the record as already
-// present, modeling a previous finalize attempt's surviving row.
-type dbStoreConflictFileClient struct {
+// dbReplaceFileClient fails DBStore while a previous attempt's record exists
+// and accepts it after DBDelete removes that record.
+type dbReplaceFileClient struct {
 	db.FileDBClient
-	err error
+	deleted bool
+	stored  *db.FileItem
 }
 
-func (d *dbStoreConflictFileClient) DBStore(_ context.Context, _ *db.FileItem) error {
-	return d.err
+func (d *dbReplaceFileClient) DBStore(_ context.Context, item *db.FileItem) error {
+	if !d.deleted {
+		return errors.New("duplicate key")
+	}
+	d.stored = item
+	return nil
 }
 
-func (d *dbStoreConflictFileClient) DBGet(_ context.Context, q *db.FileQuery, _ bool, _, _ int) ([]*db.FileItem, int, bool, error) {
-	return []*db.FileItem{{BaseIndexes: db.BaseIndexes{ID: q.IDs[0]}}}, 0, false, nil
+func (d *dbReplaceFileClient) DBDelete(_ context.Context, ids []string) ([]string, error) {
+	d.deleted = true
+	return ids, nil
 }
 
-// alwaysExistsFilesClient rejects every Store with ErrFileExists, modeling a
-// blob left by a previous finalize attempt under the same deterministic name.
-type alwaysExistsFilesClient struct{}
+// existingBlobFilesClient holds one pre-existing blob, modeling an artifact
+// left by a previous finalize attempt under the same deterministic name.
+// Store rejects while the blob exists; Delete removes it.
+type existingBlobFilesClient struct {
+	deleted bool
+	stores  int
+}
 
-func (a *alwaysExistsFilesClient) Store(_ context.Context, name, _ string, _, _ int64, _ io.Reader) (*filesapi.BatchFileMetadata, error) {
-	return nil, fmt.Errorf("%w: %s", filesapi.ErrFileExists, name)
+func (e *existingBlobFilesClient) Store(_ context.Context, name, _ string, _, _ int64, r io.Reader) (*filesapi.BatchFileMetadata, error) {
+	if !e.deleted {
+		return nil, fmt.Errorf("%w: %s", filesapi.ErrFileExists, name)
+	}
+	e.stores++
+	n, err := io.Copy(io.Discard, r)
+	if err != nil {
+		return nil, err
+	}
+	return &filesapi.BatchFileMetadata{Size: n}, nil
 }
-func (a *alwaysExistsFilesClient) Retrieve(_ context.Context, _, _ string) (io.ReadCloser, *filesapi.BatchFileMetadata, error) {
-	return nil, nil, nil
+func (e *existingBlobFilesClient) Retrieve(_ context.Context, _, _ string) (io.ReadCloser, *filesapi.BatchFileMetadata, error) {
+	return nil, nil, errors.New("not implemented")
 }
-func (a *alwaysExistsFilesClient) List(_ context.Context, _ string) ([]filesapi.BatchFileMetadata, error) {
+func (e *existingBlobFilesClient) List(_ context.Context, _ string) ([]filesapi.BatchFileMetadata, error) {
 	return nil, nil
 }
-func (a *alwaysExistsFilesClient) Delete(_ context.Context, _, _ string) error { return nil }
-func (a *alwaysExistsFilesClient) GetContext(p context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+func (e *existingBlobFilesClient) Delete(_ context.Context, _, _ string) error {
+	e.deleted = true
+	return nil
+}
+func (e *existingBlobFilesClient) GetContext(p context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithCancel(p)
 }
-func (a *alwaysExistsFilesClient) Close() error { return nil }
+func (e *existingBlobFilesClient) Close() error { return nil }
+
+// ctxCapturingResultDB records the context liveness of each ResultStore call.
+type ctxCapturingResultDB struct {
+	db.ResultDBClient
+	storedWithLiveCtx []bool
+}
+
+func (c *ctxCapturingResultDB) ResultStore(ctx context.Context, _ *db.ResultRow) error {
+	c.storedWithLiveCtx = append(c.storedWithLiveCtx, ctx.Err() == nil)
+	return nil
+}
+
+func (c *ctxCapturingResultDB) ResultGetAll(_ context.Context, _ string) ([]*db.ResultRow, error) {
+	return nil, nil
+}
