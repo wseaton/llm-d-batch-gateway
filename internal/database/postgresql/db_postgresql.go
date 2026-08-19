@@ -95,6 +95,26 @@ func tokenAfter(tokens []string, keyword string) string {
 }
 
 // newPool creates a new pgxpool.Pool from a PostgreSQLConfig.
+// Pool is one component's connection pool, shared by its table clients.
+type Pool struct {
+	pool pgxPool
+}
+
+// NewPool connects the pgx pool the component's table clients share. The
+// caller owns it and closes it once, after every client is done.
+func NewPool(ctx context.Context, config *PostgreSQLConfig) (*Pool, error) {
+	pool, err := newPool(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	return &Pool{pool: pool}, nil
+}
+
+func (p *Pool) Close() error {
+	p.pool.Close()
+	return nil
+}
+
 func newPool(ctx context.Context, config *PostgreSQLConfig) (pgxPool, error) {
 	if config == nil {
 		return nil, fmt.Errorf("config is nil")
