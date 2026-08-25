@@ -46,12 +46,10 @@ type AIMDConfig struct {
 // the limit increases by AdditiveIncrease. Any rate-limit signal resets the
 // window and cuts the limit by BackoffFactor.
 //
-// setFn is called outside the controller mutex to avoid lock-ordering issues
-// with the semaphore's own mutex. This means concurrent RecordSuccess and
-// RecordRateLimit calls may interleave their setFn invocations, causing the
-// semaphore's limit to temporarily diverge from c.limit. The divergence is
-// corrected by the next setFn call. This eventual consistency is acceptable
-// for AIMD's approximate control semantics.
+// setFn is called under the controller mutex, so its calls are ordered
+// exactly as the limit decisions were made and the target (the endpoint
+// semaphore) never diverges from Limit(). setFn must not call back into the
+// controller. See docs/design/aimd-controller.md.
 type AIMDController struct {
 	mu           sync.Mutex
 	cfg          AIMDConfig
@@ -82,40 +80,26 @@ func NewAIMDController(cfg AIMDConfig, initialLimit int, setFn func(int), logger
 // RecordSuccess records a successful request. After `limit` consecutive
 // successes (one full window), the limit increases by AdditiveIncrease.
 func (c *AIMDController) RecordSuccess() {
-	newLimit := c.computeSuccessLimit()
-	if newLimit > 0 {
-		c.setFn(newLimit)
-	}
-}
-
-func (c *AIMDController) computeSuccessLimit() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.successCount++
-	if c.successCount >= c.limit {
-		oldLimit := c.limit
-		c.limit = min(c.limit+c.cfg.AdditiveIncrease, c.cfg.MaxLimit)
-		c.successCount = 0
-		if c.limit != oldLimit {
-			c.logger.V(logging.INFO).Info("AIMD increase", "old", oldLimit, "new", c.limit)
-			return c.limit
-		}
+	if c.successCount < c.limit {
+		return
 	}
-	return 0
+	oldLimit := c.limit
+	c.limit = min(c.limit+c.cfg.AdditiveIncrease, c.cfg.MaxLimit)
+	c.successCount = 0
+	if c.limit != oldLimit {
+		c.logger.V(logging.INFO).Info("AIMD increase", "old", oldLimit, "new", c.limit)
+		c.setFn(c.limit)
+	}
 }
 
 // RecordRateLimit records a rate-limit or overload signal. The limit is cut by
 // BackoffFactor and the success counter is reset. The reason parameter
 // (e.g. "429", "5xx", "capacity_retry") is included in the log for diagnostics.
 func (c *AIMDController) RecordRateLimit(reason string) {
-	newLimit := c.computeBackoffLimit(reason)
-	if newLimit > 0 {
-		c.setFn(newLimit)
-	}
-}
-
-func (c *AIMDController) computeBackoffLimit(reason string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -124,9 +108,8 @@ func (c *AIMDController) computeBackoffLimit(reason string) int {
 	c.successCount = 0
 	if c.limit != oldLimit {
 		c.logger.V(logging.INFO).Info("AIMD decrease", "old", oldLimit, "new", c.limit, "reason", reason)
-		return c.limit
+		c.setFn(c.limit)
 	}
-	return 0
 }
 
 // Limit returns the current concurrency limit.
