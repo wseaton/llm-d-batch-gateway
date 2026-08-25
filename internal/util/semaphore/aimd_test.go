@@ -325,3 +325,168 @@ func BenchmarkAIMDRecordRateLimit(b *testing.B) {
 		c.RecordRateLimit("429")
 	}
 }
+
+// TestAIMDTrajectory pins the limit sequence a signal sequence produces, so a
+// change to the window or backoff rule shows up as a diff against the spec
+// (docs/design/aimd-controller.md).
+func TestAIMDTrajectory(t *testing.T) {
+	type step struct {
+		signal string // "ok" or a rate-limit reason
+		times  int
+	}
+	tests := []struct {
+		name     string
+		cfg      AIMDConfig
+		initial  int
+		steps    []step
+		wantSets []int // every setFn call, in order
+		wantEnd  int
+	}{
+		{
+			name:    "one window per increase, window length is the current limit",
+			cfg:     AIMDConfig{MinLimit: 1, MaxLimit: 10, BackoffFactor: 0.5, AdditiveIncrease: 1},
+			initial: 2,
+			steps:   []step{{"ok", 2}, {"ok", 3}, {"ok", 4}},
+			// 2 successes -> 3, then 3 -> 4, then 4 -> 5
+			wantSets: []int{3, 4, 5},
+			wantEnd:  5,
+		},
+		{
+			name:    "decrease halves and rounds down",
+			cfg:     AIMDConfig{MinLimit: 1, MaxLimit: 100, BackoffFactor: 0.5, AdditiveIncrease: 1},
+			initial: 7,
+			steps:   []step{{"429", 1}, {"429", 1}},
+			// floor(7*0.5)=3, floor(3*0.5)=1
+			wantSets: []int{3, 1},
+			wantEnd:  1,
+		},
+		{
+			name:    "decrease clamps at the floor and stops calling setFn",
+			cfg:     AIMDConfig{MinLimit: 5, MaxLimit: 20, BackoffFactor: 0.5, AdditiveIncrease: 1},
+			initial: 20,
+			steps:   []step{{"503", 3}},
+			// 20 -> 10 -> 5 -> 5 (unchanged, no call)
+			wantSets: []int{10, 5},
+			wantEnd:  5,
+		},
+		{
+			name:    "a decrease discards partial window progress",
+			cfg:     AIMDConfig{MinLimit: 1, MaxLimit: 20, BackoffFactor: 0.5, AdditiveIncrease: 1},
+			initial: 10,
+			// 9 successes, decrease to 5, then 4 successes: no increase yet, the 5th triggers it
+			steps:    []step{{"ok", 9}, {"capacity_retry", 1}, {"ok", 4}, {"ok", 1}},
+			wantSets: []int{5, 6},
+			wantEnd:  6,
+		},
+		{
+			name:    "a decrease at the floor still resets the window",
+			cfg:     AIMDConfig{MinLimit: 5, MaxLimit: 20, BackoffFactor: 0.5, AdditiveIncrease: 1},
+			initial: 5,
+			// 4 successes, a no-op decrease, then 4 more: still no increase; the 5th after reset increases
+			steps:    []step{{"ok", 4}, {"429", 1}, {"ok", 4}, {"ok", 1}},
+			wantSets: []int{6},
+			wantEnd:  6,
+		},
+		{
+			name:    "increase clamps at the ceiling and stops calling setFn",
+			cfg:     AIMDConfig{MinLimit: 1, MaxLimit: 3, BackoffFactor: 0.5, AdditiveIncrease: 5},
+			initial: 2,
+			steps:   []step{{"ok", 2}, {"ok", 3}},
+			// 2 -> min(7,3)=3, then 3 -> 3 (unchanged, no call)
+			wantSets: []int{3},
+			wantEnd:  3,
+		},
+		{
+			name:     "recovery from the floor takes min successes per step",
+			cfg:      AIMDConfig{MinLimit: 5, MaxLimit: 20, BackoffFactor: 0.5, AdditiveIncrease: 1},
+			initial:  20,
+			steps:    []step{{"429", 2}, {"ok", 5}, {"ok", 6}, {"ok", 7}},
+			wantSets: []int{10, 5, 6, 7, 8},
+			wantEnd:  8,
+		},
+		{
+			name:    "backoff factor other than one half",
+			cfg:     AIMDConfig{MinLimit: 1, MaxLimit: 100, BackoffFactor: 0.8, AdditiveIncrease: 2},
+			initial: 10,
+			// floor(10*0.8)=8; window of 8 -> 10
+			steps:    []step{{"5xx", 1}, {"ok", 8}},
+			wantSets: []int{8, 10},
+			wantEnd:  10,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var sets []int
+			c := NewAIMDController(tt.cfg, tt.initial, func(n int) { sets = append(sets, n) }, logr.Discard())
+			for _, st := range tt.steps {
+				for range st.times {
+					if st.signal == "ok" {
+						c.RecordSuccess()
+					} else {
+						c.RecordRateLimit(st.signal)
+					}
+				}
+			}
+			if got := c.Limit(); got != tt.wantEnd {
+				t.Errorf("Limit() = %d, want %d", got, tt.wantEnd)
+			}
+			if len(sets) != len(tt.wantSets) {
+				t.Fatalf("setFn calls = %v, want %v", sets, tt.wantSets)
+			}
+			for i := range sets {
+				if sets[i] != tt.wantSets[i] {
+					t.Fatalf("setFn calls = %v, want %v", sets, tt.wantSets)
+				}
+			}
+		})
+	}
+}
+
+// TestAIMDSemaphoreNeverDiverges drives a real AdaptiveSemaphore through the
+// controller from many goroutines and checks, after every signal and at the
+// end, that the semaphore's limit equals the controller's. setFn runs under
+// the controller mutex, so the two can never be observed apart.
+func TestAIMDSemaphoreNeverDiverges(t *testing.T) {
+	sem, err := NewAdaptive(64, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := AIMDConfig{MinLimit: 2, MaxLimit: 64, BackoffFactor: 0.5, AdditiveIncrease: 3}
+	c := NewAIMDController(cfg, 64, sem.SetLimit, logr.Discard())
+
+	var wg sync.WaitGroup
+	var mismatches atomic.Int32
+	for g := range 16 {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := range 500 {
+				if (i+g)%7 == 0 {
+					c.RecordRateLimit("429")
+				} else {
+					c.RecordSuccess()
+				}
+				// Read both under no lock: a diverged pair is a real observable state.
+				cl, sl := c.Limit(), sem.Limit()
+				if cl != sl {
+					// Another goroutine may have moved both between the two reads;
+					// re-read once to separate a torn read from a real divergence.
+					if cl2, sl2 := c.Limit(), sem.Limit(); cl2 == cl && sl2 == sl {
+						mismatches.Add(1)
+					}
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	if got := mismatches.Load(); got != 0 {
+		t.Fatalf("observed %d stable controller/semaphore limit mismatches", got)
+	}
+	if c.Limit() != sem.Limit() {
+		t.Fatalf("final controller limit %d != semaphore limit %d", c.Limit(), sem.Limit())
+	}
+	if l := c.Limit(); l < cfg.MinLimit || l > cfg.MaxLimit {
+		t.Fatalf("Limit() = %d, out of [%d, %d]", l, cfg.MinLimit, cfg.MaxLimit)
+	}
+}
