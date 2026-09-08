@@ -44,7 +44,11 @@ records version 1.
    binaries against the new schema. Expand first (add columns, add tables,
    backfill), and contract (drop, rename, tighten constraints) only in a later
    release once nothing reads the old shape.
-4. Bump nothing else. The expected version is the number of embedded files.
+4. Write plain DDL, no `IF NOT EXISTS` guards. Migration `0001` uses them only
+   to adopt databases created before versioning existed. From `0002` on, the
+   version table is authoritative and a statement that finds its object
+   already present is a bug worth failing on.
+5. Bump nothing else. The expected version is the number of embedded files.
 
 ## Running locally
 
