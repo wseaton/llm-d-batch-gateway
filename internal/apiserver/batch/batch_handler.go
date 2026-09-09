@@ -534,6 +534,7 @@ const maxCancelAttempts = 3
 func (c *BatchAPIHandler) markCancelling(ctx context.Context, item *api.BatchItem, batch *openai.Batch) (*openai.Batch, error) {
 	tenantID := common.GetTenantIDFromContext(ctx)
 	fromStatus := batch.Status
+	failpoint.Inject("apiserver/before-cancel-dbupdate")
 	for attempt := 1; ; attempt++ {
 		batch.Status = openai.BatchStatusCancelling
 		cancellingAt := time.Now().UTC().Unix()
