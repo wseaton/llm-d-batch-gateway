@@ -27,7 +27,8 @@ VLLM_SIM_B_MODEL="${VLLM_SIM_B_MODEL:-sim-model-b}"
 # Inference backend: vllm-vcr (the real vLLM Rust frontend over a simulated
 # engine-core). VLLM_SIM_HF_MODEL is the Hugging Face id the frontend loads the
 # tokenizer from; the model names above are what clients use.
-VLLM_SIM_IMAGE="${VLLM_SIM_IMAGE:-ghcr.io/neuralmagic/vllm-vcr:0.2.2-vllm0.27}"
+VLLM_SIM_MANIFEST="${SCRIPT_DIR}/manifests/vllm-vcr.yaml"
+VLLM_SIM_IMAGE="${VLLM_SIM_IMAGE:-$(grep -m1 -E '^\s*image: ghcr.io/neuralmagic/vllm-vcr:' "${VLLM_SIM_MANIFEST}" | awk '{print $2}')}"
 VLLM_SIM_HF_MODEL="${VLLM_SIM_HF_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
 VLLM_SIM_CONTROL_PORT="${VLLM_SIM_CONTROL_PORT:-8001}"
 JAEGER_IMAGE="${JAEGER_IMAGE:-${IMAGE_REGISTRY}/jaegertracing/all-in-one:latest}"
@@ -97,7 +98,7 @@ detect_container_tool() {
 check_prerequisites() {
     step "Checking prerequisites..."
     local missing=()
-    for cmd in kubectl helm kind make; do
+    for cmd in kubectl helm kind make envsubst; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [ ${#missing[@]} -gt 0 ]; then
@@ -827,92 +828,14 @@ install_vllm_sim() {
 
     step "Installing vllm-vcr '${sim_name}' (model: ${sim_model}, ttft=${time_to_first_token_ms}ms, itl=${inter_token_latency_ms}ms)..."
 
-    kubectl apply -f - <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ${sim_name}
-  namespace: ${NAMESPACE}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: ${sim_name}
-  template:
-    metadata:
-      labels:
-        app: ${sim_name}
-    spec:
-      containers:
-      - name: vllm-vcr
-        image: ${VLLM_SIM_IMAGE}
-        imagePullPolicy: IfNotPresent
-        env:
-        - name: MODEL
-          value: ${VLLM_SIM_HF_MODEL}
-        - name: SERVED_MODEL_NAME
-          value: "${served_model_name}"
-        - name: VLLM_EXTRA_ARGS
-          value: "${vllm_extra_args}"
-        - name: MOCK_TTFT_MS
-          value: "${time_to_first_token_ms}"
-        - name: MOCK_ITL_MS
-          value: "${inter_token_latency_ms}"
-        - name: MOCK_CONTROL_PORT
-          value: "${VLLM_SIM_CONTROL_PORT}"
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
-        - name: POD_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.podIP
-        ports:
-        - containerPort: 8000
-          name: http
-          protocol: TCP
-        - containerPort: ${VLLM_SIM_CONTROL_PORT}
-          name: control
-          protocol: TCP
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: http
-          periodSeconds: 2
-          failureThreshold: 90
-        resources:
-          requests:
-            cpu: 50m
-            memory: 256Mi
-        volumeMounts:
-        - name: hf-cache
-          mountPath: /tmp/hf
-      volumes:
-      - name: hf-cache
-        emptyDir: {}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: ${sim_name}
-  namespace: ${NAMESPACE}
-  labels:
-    app: ${sim_name}
-spec:
-  selector:
-    app: ${sim_name}
-  ports:
-  - name: http
-    protocol: TCP
-    port: 8000
-    targetPort: 8000
-  - name: control
-    protocol: TCP
-    port: ${VLLM_SIM_CONTROL_PORT}
-    targetPort: ${VLLM_SIM_CONTROL_PORT}
-  type: ClusterIP
-EOF
+    SIM_NAME="${sim_name}" SIM_SERVED_MODEL_NAME="${served_model_name}" \
+    SIM_VLLM_EXTRA_ARGS="${vllm_extra_args}" SIM_TTFT_MS="${time_to_first_token_ms}" \
+    SIM_ITL_MS="${inter_token_latency_ms}" NAMESPACE="${NAMESPACE}" \
+    VLLM_SIM_HF_MODEL="${VLLM_SIM_HF_MODEL}" VLLM_SIM_CONTROL_PORT="${VLLM_SIM_CONTROL_PORT}" \
+        envsubst '${SIM_NAME} ${SIM_SERVED_MODEL_NAME} ${SIM_VLLM_EXTRA_ARGS} ${SIM_TTFT_MS} ${SIM_ITL_MS} ${NAMESPACE} ${VLLM_SIM_HF_MODEL} ${VLLM_SIM_CONTROL_PORT}' \
+        < "${VLLM_SIM_MANIFEST}" \
+        | sed "s#image: ghcr.io/neuralmagic/vllm-vcr:.*#image: ${VLLM_SIM_IMAGE}#" \
+        | kubectl apply -f -
 
     # First start downloads the tokenizer from Hugging Face into the pod's cache.
     wait_for_deployment "${sim_name}" "${NAMESPACE}" 300s

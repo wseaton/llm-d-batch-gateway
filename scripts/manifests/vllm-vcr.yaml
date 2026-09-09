@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${SIM_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${SIM_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${SIM_NAME}
+    spec:
+      containers:
+      - name: vllm-vcr
+        image: ghcr.io/neuralmagic/vllm-vcr:0.2.2-vllm0.27
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: MODEL
+          value: ${VLLM_SIM_HF_MODEL}
+        - name: SERVED_MODEL_NAME
+          value: "${SIM_SERVED_MODEL_NAME}"
+        - name: VLLM_EXTRA_ARGS
+          value: "${SIM_VLLM_EXTRA_ARGS}"
+        - name: MOCK_TTFT_MS
+          value: "${SIM_TTFT_MS}"
+        - name: MOCK_ITL_MS
+          value: "${SIM_ITL_MS}"
+        - name: MOCK_CONTROL_PORT
+          value: "${VLLM_SIM_CONTROL_PORT}"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        - containerPort: ${VLLM_SIM_CONTROL_PORT}
+          name: control
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 2
+          failureThreshold: 90
+        resources:
+          requests:
+            cpu: 50m
+            memory: 256Mi
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /tmp/hf
+      volumes:
+      - name: hf-cache
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${SIM_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${SIM_NAME}
+spec:
+  selector:
+    app: ${SIM_NAME}
+  ports:
+  - name: http
+    protocol: TCP
+    port: 8000
+    targetPort: 8000
+  - name: control
+    protocol: TCP
+    port: ${VLLM_SIM_CONTROL_PORT}
+    targetPort: ${VLLM_SIM_CONTROL_PORT}
+  type: ClusterIP
