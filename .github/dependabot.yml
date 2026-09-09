@@ -50,3 +50,15 @@ updates:
       - "dependencies"
     commit-message:
       prefix: "deps(docker)"
+
+  # vllm-vcr image pin used by dev-deploy and the e2e suite. Dependabot keeps
+  # the -vllm<line> suffix and bumps the vcr release within it.
+  - package-ecosystem: "docker"
+    directory: "/scripts/manifests"
+    schedule:
+      interval: "daily"
+    labels:
+      - "dependencies"
+      - "release-note-none"
+    commit-message:
+      prefix: "deps(vllm-vcr)"
