@@ -274,9 +274,13 @@ create_secret() {
     local redis_url="redis://${exchange_svc}.${NAMESPACE}.svc.cluster.local:6379/0"
     local postgresql_url="postgresql://postgres:${POSTGRESQL_PASSWORD}@${POSTGRESQL_RELEASE}.${NAMESPACE}.svc.cluster.local:5432/postgres"
 
+    local redis_args=()
+    if needs_redis; then
+        redis_args=(--from-literal=redis-url="${redis_url}")
+    fi
     kubectl create secret generic "${APP_SECRET_NAME}" \
         --namespace "${NAMESPACE}" \
-        --from-literal=redis-url="${redis_url}" \
+        ${redis_args[@]+"${redis_args[@]}"} \
         --from-literal=postgresql-url="${postgresql_url}" \
         --from-literal=inference-api-key="${INFERENCE_API_KEY}" \
         --from-literal=s3-secret-access-key="${S3_SECRET_ACCESS_KEY}" \
@@ -1516,7 +1520,9 @@ main() {
         build_images
     fi
     ensure_cluster
-    install_exchange
+    if needs_redis; then
+        install_exchange
+    fi
     install_postgresql
     create_secret
     create_tls_secret

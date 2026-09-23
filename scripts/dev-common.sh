@@ -28,6 +28,9 @@ JAEGER_PORT="${JAEGER_PORT:-16686}"
 # Service names
 REDIS_RELEASE="${REDIS_RELEASE:-redis}"
 EXCHANGE_CLIENT_TYPE="${EXCHANGE_CLIENT_TYPE:-redis}"
+# DISPATCHER_TRANSPORT=sql runs llm-d-async on the sql transport against the
+# batch-gateway Postgres, so the deployment has no Redis at all.
+DISPATCHER_TRANSPORT="${DISPATCHER_TRANSPORT:-redis-sortedset}"
 POSTGRESQL_RELEASE="${POSTGRESQL_RELEASE:-postgresql}"
 JAEGER_NAME="${JAEGER_NAME:-jaeger}"
 PROMETHEUS_NAME="${PROMETHEUS_NAME:-prometheus}"
@@ -43,3 +46,8 @@ MINIO_NAME="${MINIO_NAME:-minio}"
 TLS_SECRET_NAME="${TLS_SECRET_NAME:-${HELM_RELEASE}-tls}"
 APP_SECRET_NAME="${APP_SECRET_NAME:-${HELM_RELEASE}-secrets}"
 FILES_PVC_NAME="${FILES_PVC_NAME:-${HELM_RELEASE}-files}"
+
+# Redis backs only llm-d-async's redis transport; the batch gateway itself runs on Postgres.
+needs_redis() {
+    [[ "${ENABLE_DISPATCHER:-false}" == "true" && "${DISPATCHER_TRANSPORT}" != "sql" ]]
+}

@@ -18,11 +18,16 @@ ap:
       key: "postgresql-url"
     poll_interval_ms: 500
     batch_size: 10
-    claim_lease_ttl_seconds: 3
+    lease_ttl_seconds: 3
     queues:
       - queue_name: "llm-d-async:requests:sim-pool"
         request_path_url: "/v1/completions"
         igw_base_url: "http://vllm-sim.default.svc.cluster.local:8000"
+        gate_type: "constant"
+        gate_params: {}
+      - queue_name: "llm-d-async:requests:sim-pool-b"
+        request_path_url: "/v1/completions"
+        igw_base_url: "http://vllm-sim-b.default.svc.cluster.local:8000"
         gate_type: "constant"
         gate_params: {}
       - queue_name: "llm-d-async:requests:sim-pool-gate"

@@ -23,10 +23,6 @@ PID_FILE="${REPO_ROOT}/.dispatcher-port-forward.pid"
 # instead of pulling a released image. The local chart is used automatically.
 # Example: DISPATCHER_SOURCE=~/src/llm-d-async ENABLE_DISPATCHER=true make dev-deploy
 DISPATCHER_SOURCE="${DISPATCHER_SOURCE:-}"
-# DISPATCHER_TRANSPORT=sql additionally deploys a dispatcher on the sql
-# transport (sharing the batch-gateway Postgres) and switches the processor's
-# async producers to it. Default: redis-sortedset.
-DISPATCHER_TRANSPORT="${DISPATCHER_TRANSPORT:-redis-sortedset}"
 DISPATCHER_SQL_RELEASE="${DISPATCHER_SQL_RELEASE:-dispatcher-sql}"
 
 # ── Prerequisites (standalone only — dev-deploy.sh already checks these) ─────
@@ -110,64 +106,6 @@ if [[ -z "${DISPATCHER_SOURCE}" ]]; then
     DISPATCHER_IMAGE_PULL_POLICY="IfNotPresent"
 fi
 
-step "Deploying async-processor with redis gate (release: ${DISPATCHER_RELEASE})..."
-helm upgrade --install "${DISPATCHER_RELEASE}" "${DISPATCHER_CHART}" \
-    ${HELM_VERSION_FLAG[@]+"${HELM_VERSION_FLAG[@]}"} \
-    --namespace "${NAMESPACE}" \
-    --values "${HELM_VALUES}" \
-    --set-string "ap.image.repository=${DISPATCHER_IMAGE_REPO}" \
-    --set-string "ap.image.tag=${DISPATCHER_IMAGE_TAG}" \
-    --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
-    --timeout=120s
-
-step "Deploying async-processor with endpoint-scrape gate (release: ${DISPATCHER_SCRAPE_RELEASE})..."
-helm upgrade --install "${DISPATCHER_SCRAPE_RELEASE}" "${DISPATCHER_CHART}" \
-    ${HELM_VERSION_FLAG[@]+"${HELM_VERSION_FLAG[@]}"} \
-    --namespace "${NAMESPACE}" \
-    --values "${HELM_VALUES_SCRAPE}" \
-    --set-string "ap.image.repository=${DISPATCHER_IMAGE_REPO}" \
-    --set-string "ap.image.tag=${DISPATCHER_IMAGE_TAG}" \
-    --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
-    --timeout=120s
-
-DISPATCHER_PROM_RELEASE="${DISPATCHER_PROM_RELEASE:-dispatcher-prom}"
-HELM_VALUES_PROM="${REPO_ROOT}/test/e2e/dispatcher/helm-values-prometheus.yaml"
-
-step "Deploying async-processor with prometheus-query gate (release: ${DISPATCHER_PROM_RELEASE})..."
-helm upgrade --install "${DISPATCHER_PROM_RELEASE}" "${DISPATCHER_CHART}" \
-    ${HELM_VERSION_FLAG[@]+"${HELM_VERSION_FLAG[@]}"} \
-    --namespace "${NAMESPACE}" \
-    --values "${HELM_VALUES_PROM}" \
-    --set-string "ap.image.repository=${DISPATCHER_IMAGE_REPO}" \
-    --set-string "ap.image.tag=${DISPATCHER_IMAGE_TAG}" \
-    --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
-    --timeout=120s
-
-if [[ "${DISPATCHER_TRANSPORT}" == "sql" ]]; then
-    HELM_VALUES_SQL="${REPO_ROOT}/test/e2e/dispatcher/helm-values-sql.yaml"
-    step "Deploying async-processor with sql transport (release: ${DISPATCHER_SQL_RELEASE})..."
-    helm upgrade --install "${DISPATCHER_SQL_RELEASE}" "${DISPATCHER_CHART}" \
-        ${HELM_VERSION_FLAG[@]+"${HELM_VERSION_FLAG[@]}"} \
-        --namespace "${NAMESPACE}" \
-        --values "${HELM_VALUES_SQL}" \
-        --set-string "ap.transportConfig.urlSecret.name=${APP_SECRET_NAME}" \
-        --set-string "ap.image.repository=${IMAGE_REPO}" \
-        --set-string "ap.image.tag=${IMAGE_TAG}" \
-        --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
-        --timeout=120s
-fi
-
-log "Dispatchers deployed."
-
-# ── Verify dispatchers ───────────────────────────────────────────────────────
-step "Waiting for dispatcher pods to be ready..."
-kubectl wait --for=condition=available deployment/"${DISPATCHER_RELEASE}-llm-d-async" \
-    --namespace "${NAMESPACE}" --timeout=60s
-kubectl wait --for=condition=available deployment/"${DISPATCHER_SCRAPE_RELEASE}-llm-d-async" \
-    --namespace "${NAMESPACE}" --timeout=60s
-kubectl wait --for=condition=available deployment/"${DISPATCHER_PROM_RELEASE}-llm-d-async" \
-    --namespace "${NAMESPACE}" --timeout=60s
-
 verify_dispatcher_runtime_image() {
     local release="$1"
     local pod
@@ -194,13 +132,74 @@ verify_dispatcher_runtime_image() {
     log "Verified ${pod} uses ${actual_image} (runtime imageID: ${image_id})"
 }
 
-verify_dispatcher_runtime_image "${DISPATCHER_RELEASE}"
-verify_dispatcher_runtime_image "${DISPATCHER_SCRAPE_RELEASE}"
-verify_dispatcher_runtime_image "${DISPATCHER_PROM_RELEASE}"
 if [[ "${DISPATCHER_TRANSPORT}" == "sql" ]]; then
+    HELM_VALUES_SQL="${REPO_ROOT}/test/e2e/dispatcher/helm-values-sql.yaml"
+    step "Deploying async-processor with sql transport (release: ${DISPATCHER_SQL_RELEASE})..."
+    helm upgrade --install "${DISPATCHER_SQL_RELEASE}" "${DISPATCHER_CHART}" \
+        ${HELM_VERSION_FLAG[@]+"${HELM_VERSION_FLAG[@]}"} \
+        --namespace "${NAMESPACE}" \
+        --values "${HELM_VALUES_SQL}" \
+        --set-string "ap.transportConfig.urlSecret.name=${APP_SECRET_NAME}" \
+        --set-string "ap.image.repository=${DISPATCHER_IMAGE_REPO}" \
+        --set-string "ap.image.tag=${DISPATCHER_IMAGE_TAG}" \
+        --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
+        --timeout=120s
+    log "Dispatcher deployed."
+
+    step "Waiting for dispatcher pods to be ready..."
     kubectl wait --for=condition=available deployment/"${DISPATCHER_SQL_RELEASE}-llm-d-async" \
         --namespace "${NAMESPACE}" --timeout=60s
     verify_dispatcher_runtime_image "${DISPATCHER_SQL_RELEASE}"
+else
+    step "Deploying async-processor with redis gate (release: ${DISPATCHER_RELEASE})..."
+    helm upgrade --install "${DISPATCHER_RELEASE}" "${DISPATCHER_CHART}" \
+        ${HELM_VERSION_FLAG[@]+"${HELM_VERSION_FLAG[@]}"} \
+        --namespace "${NAMESPACE}" \
+        --values "${HELM_VALUES}" \
+        --set-string "ap.image.repository=${DISPATCHER_IMAGE_REPO}" \
+        --set-string "ap.image.tag=${DISPATCHER_IMAGE_TAG}" \
+        --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
+        --timeout=120s
+
+    step "Deploying async-processor with endpoint-scrape gate (release: ${DISPATCHER_SCRAPE_RELEASE})..."
+    helm upgrade --install "${DISPATCHER_SCRAPE_RELEASE}" "${DISPATCHER_CHART}" \
+        ${HELM_VERSION_FLAG[@]+"${HELM_VERSION_FLAG[@]}"} \
+        --namespace "${NAMESPACE}" \
+        --values "${HELM_VALUES_SCRAPE}" \
+        --set-string "ap.image.repository=${DISPATCHER_IMAGE_REPO}" \
+        --set-string "ap.image.tag=${DISPATCHER_IMAGE_TAG}" \
+        --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
+        --timeout=120s
+
+    DISPATCHER_PROM_RELEASE="${DISPATCHER_PROM_RELEASE:-dispatcher-prom}"
+    HELM_VALUES_PROM="${REPO_ROOT}/test/e2e/dispatcher/helm-values-prometheus.yaml"
+
+    step "Deploying async-processor with prometheus-query gate (release: ${DISPATCHER_PROM_RELEASE})..."
+    helm upgrade --install "${DISPATCHER_PROM_RELEASE}" "${DISPATCHER_CHART}" \
+        ${HELM_VERSION_FLAG[@]+"${HELM_VERSION_FLAG[@]}"} \
+        --namespace "${NAMESPACE}" \
+        --values "${HELM_VALUES_PROM}" \
+        --set-string "ap.image.repository=${DISPATCHER_IMAGE_REPO}" \
+        --set-string "ap.image.tag=${DISPATCHER_IMAGE_TAG}" \
+        --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
+        --timeout=120s
+
+
+    log "Dispatchers deployed."
+
+    # ── Verify dispatchers ───────────────────────────────────────────────────────
+    step "Waiting for dispatcher pods to be ready..."
+    kubectl wait --for=condition=available deployment/"${DISPATCHER_RELEASE}-llm-d-async" \
+        --namespace "${NAMESPACE}" --timeout=60s
+    kubectl wait --for=condition=available deployment/"${DISPATCHER_SCRAPE_RELEASE}-llm-d-async" \
+        --namespace "${NAMESPACE}" --timeout=60s
+    kubectl wait --for=condition=available deployment/"${DISPATCHER_PROM_RELEASE}-llm-d-async" \
+        --namespace "${NAMESPACE}" --timeout=60s
+
+
+    verify_dispatcher_runtime_image "${DISPATCHER_RELEASE}"
+    verify_dispatcher_runtime_image "${DISPATCHER_SCRAPE_RELEASE}"
+    verify_dispatcher_runtime_image "${DISPATCHER_PROM_RELEASE}"
 fi
 
 # ── Add vllm-sim to Prometheus scrape targets ────────────────────────────────
@@ -269,52 +268,54 @@ fi
 # dev-deploy.sh reserves this NodePort in Kind's extraPortMappings. Create the
 # matching service instead of competing with Docker's host listener by trying
 # to bind kubectl port-forward to the same port.
-step "Exposing Redis on localhost:${DISPATCHER_REDIS_PORT}..."
+if needs_redis; then
+    step "Exposing Redis on localhost:${DISPATCHER_REDIS_PORT}..."
 
-# Clean up a port-forward left by an older version of this harness.
-if [[ -f "${PID_FILE}" ]]; then
-    old_pid=$(cat "${PID_FILE}")
-    kill "${old_pid}" 2>/dev/null || true
-    rm -f "${PID_FILE}"
-fi
-
-# Detect Redis service name
-redis_svc="${REDIS_RELEASE}-master"
-if [[ "${EXCHANGE_CLIENT_TYPE}" == "valkey" ]]; then
-    redis_svc="${REDIS_RELEASE}-valkey-primary"
-fi
-
-kubectl get service "${redis_svc}" --namespace "${NAMESPACE}" -o json | \
-    jq --arg name "${redis_svc}-nodeport" --argjson nodePort "${DISPATCHER_REDIS_NODE_PORT}" '{
-        apiVersion: "v1",
-        kind: "Service",
-        metadata: {name: $name, namespace: .metadata.namespace},
-        spec: {
-            type: "NodePort",
-            selector: .spec.selector,
-            ports: [(.spec.ports[0] | {
-                name: .name,
-                protocol: .protocol,
-                port: .port,
-                targetPort: .targetPort,
-                nodePort: $nodePort
-            })]
-        }
-    }' | kubectl apply -f -
-
-# Wait for Kind's host mapping to reach the NodePort service.
-for i in $(seq 1 10); do
-    if nc -z localhost "${DISPATCHER_REDIS_PORT}" 2>/dev/null; then
-        break
+    # Clean up a port-forward left by an older version of this harness.
+    if [[ -f "${PID_FILE}" ]]; then
+        old_pid=$(cat "${PID_FILE}")
+        kill "${old_pid}" 2>/dev/null || true
+        rm -f "${PID_FILE}"
     fi
-    sleep 0.5
-done
 
-if ! nc -z localhost "${DISPATCHER_REDIS_PORT}" 2>/dev/null; then
-    die "Redis NodePort failed to become reachable"
+    # Detect Redis service name
+    redis_svc="${REDIS_RELEASE}-master"
+    if [[ "${EXCHANGE_CLIENT_TYPE}" == "valkey" ]]; then
+        redis_svc="${REDIS_RELEASE}-valkey-primary"
+    fi
+
+    kubectl get service "${redis_svc}" --namespace "${NAMESPACE}" -o json | \
+        jq --arg name "${redis_svc}-nodeport" --argjson nodePort "${DISPATCHER_REDIS_NODE_PORT}" '{
+            apiVersion: "v1",
+            kind: "Service",
+            metadata: {name: $name, namespace: .metadata.namespace},
+            spec: {
+                type: "NodePort",
+                selector: .spec.selector,
+                ports: [(.spec.ports[0] | {
+                    name: .name,
+                    protocol: .protocol,
+                    port: .port,
+                    targetPort: .targetPort,
+                    nodePort: $nodePort
+                })]
+            }
+        }' | kubectl apply -f -
+
+    # Wait for Kind's host mapping to reach the NodePort service.
+    for i in $(seq 1 10); do
+        if nc -z localhost "${DISPATCHER_REDIS_PORT}" 2>/dev/null; then
+            break
+        fi
+        sleep 0.5
+    done
+
+    if ! nc -z localhost "${DISPATCHER_REDIS_PORT}" 2>/dev/null; then
+        die "Redis NodePort failed to become reachable"
+    fi
+
+    log "Redis accessible at localhost:${DISPATCHER_REDIS_PORT}"
 fi
-
-log "Redis accessible at localhost:${DISPATCHER_REDIS_PORT}"
 
 # ── Port-forward vLLM sim to host ────────────────────────────────────────────
 DISPATCHER_SIM_PORT="${DISPATCHER_SIM_PORT:-8099}"
