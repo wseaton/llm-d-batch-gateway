@@ -98,7 +98,27 @@ func newDispatcherProducer(t *testing.T, rdb *redis.Client, poolName string) *pr
 // is still configured for async dispatch.
 func detectDispatcherDeployed(t *testing.T) bool {
 	t.Helper()
+	cfg, ok := readProcessorConfig(t)
+	return ok && cfg.DispatchMode == "async"
+}
 
+// detectAsyncTransport returns the llm-d-async transport the processor submits
+// through; empty means the default redis transport.
+func detectAsyncTransport(t *testing.T) string {
+	t.Helper()
+	cfg, _ := readProcessorConfig(t)
+	return cfg.AsyncDispatch.Transport
+}
+
+type processorConfig struct {
+	DispatchMode  string `yaml:"dispatch_mode"`
+	AsyncDispatch struct {
+		Transport string `yaml:"transport"`
+	} `yaml:"async_dispatch"`
+}
+
+func readProcessorConfig(t *testing.T) (processorConfig, bool) {
+	t.Helper()
 	configMap := fmt.Sprintf("%s-processor-config", testHelmRelease)
 	out, err := exec.Command("kubectl", "get", "configmap", configMap,
 		"-n", testNamespace,
@@ -106,44 +126,44 @@ func detectDispatcherDeployed(t *testing.T) bool {
 	).CombinedOutput()
 	if err != nil {
 		t.Logf("kubectl get processor config failed: %v\n%s", err, out)
-		return false
+		return processorConfig{}, false
 	}
-	dispatchMode, err := processorDispatchMode(out)
+	cfg, err := parseProcessorConfig(out)
 	if err != nil {
 		t.Logf("parse processor config failed: %v", err)
-		return false
+		return processorConfig{}, false
 	}
-	return dispatchMode == "async"
+	return cfg, true
 }
 
-func processorDispatchMode(data []byte) (string, error) {
-	var cfg struct {
-		DispatchMode string `yaml:"dispatch_mode"`
-	}
+func parseProcessorConfig(data []byte) (processorConfig, error) {
+	var cfg processorConfig
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return "", err
+		return processorConfig{}, err
 	}
-	return cfg.DispatchMode, nil
+	return cfg, nil
 }
 
 func TestProcessorDispatchMode(t *testing.T) {
 	tests := []struct {
-		name string
-		data string
-		want string
+		name          string
+		data          string
+		wantMode      string
+		wantTransport string
 	}{
-		{name: "async", data: `dispatch_mode: "async"`, want: "async"},
-		{name: "sync", data: `dispatch_mode: "sync"`, want: "sync"},
-		{name: "omitted", data: `poll_interval: "5s"`, want: ""},
+		{name: "async", data: `dispatch_mode: "async"`, wantMode: "async"},
+		{name: "sync", data: `dispatch_mode: "sync"`, wantMode: "sync"},
+		{name: "omitted", data: `poll_interval: "5s"`},
+		{name: "async sql", data: "dispatch_mode: async\nasync_dispatch:\n  transport: sql\n", wantMode: "async", wantTransport: "sql"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := processorDispatchMode([]byte(tt.data))
+			got, err := parseProcessorConfig([]byte(tt.data))
 			if err != nil {
-				t.Fatalf("processorDispatchMode() error = %v", err)
+				t.Fatalf("parseProcessorConfig() error = %v", err)
 			}
-			if got != tt.want {
-				t.Fatalf("processorDispatchMode() = %q, want %q", got, tt.want)
+			if got.DispatchMode != tt.wantMode || got.AsyncDispatch.Transport != tt.wantTransport {
+				t.Fatalf("parseProcessorConfig() = %+v, want mode %q transport %q", got, tt.wantMode, tt.wantTransport)
 			}
 		})
 	}
@@ -152,6 +172,11 @@ func TestProcessorDispatchMode(t *testing.T) {
 func TestDispatcher(t *testing.T) {
 	if !detectDispatcherDeployed(t) {
 		t.Skip("skipping: dispatcher not deployed")
+	}
+	if detectAsyncTransport(t) == "sql" {
+		waitForServerUp(t, testApiserverURL, 30*time.Second)
+		testSQLDispatcher(t)
+		return
 	}
 	rdb := newDispatcherRedisClient(t)
 	defer rdb.Close()
