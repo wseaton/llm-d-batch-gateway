@@ -78,6 +78,12 @@ func testSQLDeploymentHasNoRedis(t *testing.T) {
 // queue, so the test takes the request row and writes a 403 result to the
 // Processor's result route itself.
 func testSQLDispatcherHTTPErrorStatusPreserved(t *testing.T) {
+	clearInject := func() {
+		psqlExec(t, fmt.Sprintf(`DELETE FROM async_requests WHERE queue = '%s'`, injectReqQueue))
+	}
+	clearInject()
+	t.Cleanup(clearInject)
+
 	jsonl := fmt.Sprintf(
 		`{"custom_id":"dreq-403","method":"POST","url":"/v1/chat/completions","body":{"model":"%s","max_tokens":5,"messages":[{"role":"user","content":"expect 403"}]}}`,
 		injectModel)
@@ -106,12 +112,10 @@ func testSQLDispatcherHTTPErrorStatusPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal ResultMessage: %v", err)
 	}
-	psqlExec(t, fmt.Sprintf(`
-WITH taken AS (
-	DELETE FROM async_requests WHERE id = '%s' AND request_token = '%s' RETURNING id, request_token
-)
-INSERT INTO async_results (route, id, request_token, payload, expires_at, created_at)
-SELECT '%s', id, request_token, '%s', 0, (extract(epoch FROM now()) * 1000000)::bigint FROM taken`,
+	psqlExec(t, fmt.Sprintf(
+		`WITH taken AS (DELETE FROM async_requests WHERE id = '%s' AND request_token = '%s' RETURNING id, request_token) `+
+			`INSERT INTO async_results (route, id, request_token, payload, expires_at, created_at) `+
+			`SELECT '%s', id, request_token, '%s', 0, (extract(epoch FROM now()) * 1000000)::bigint FROM taken`,
 		id, token, route, strings.ReplaceAll(string(result), "'", "''")))
 
 	finalBatch := waitForRetryExhaustion(t, batchID, 2*time.Minute)

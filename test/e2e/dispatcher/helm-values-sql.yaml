@@ -1,6 +1,6 @@
 ap:
   imagePullPolicy: Never
-  concurrency: 1
+  concurrency: 16
   prometheusCacheTTL: "0s"
   otel:
     endpoint: "http://jaeger.default.svc.cluster.local:4317"
