@@ -1,0 +1,356 @@
+package producer
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/llm-d/llm-d-async/api"
+	"github.com/redis/go-redis/v9"
+)
+
+var (
+	_ Producer              = (*RedisSortedSetProducer)(nil)
+	_ DurableResultProducer = (*RedisSortedSetProducer)(nil)
+)
+
+// RedisSortedSetProducer implements Producer using Redis sorted set for requests
+// and Redis list for results.
+type RedisSortedSetProducer struct {
+	client                     *redis.Client
+	managedClient              bool
+	requestQueueName           string
+	resultQueueName            string
+	resultClaimLeaseTTL        time.Duration
+	resultClaimReclaimInterval time.Duration
+}
+
+const (
+	cancellationMarkerTTL = 7 * 24 * time.Hour
+	payloadTTLGrace       = 10 * time.Minute
+)
+
+var markRequestCancelledScript = redis.NewScript(`
+local active = redis.call("GET", KEYS[1])
+if not active then
+  return 0
+end
+redis.call("SET", KEYS[2], active, "EX", ARGV[1])
+return 1
+`)
+
+// ProducerOption is a functional option for NewRedisSortedSetProducer.
+type ProducerOption func(*RedisSortedSetProducer) error
+
+// WithRedisClient injects a pre-configured *redis.Client, allowing callers to
+// instrument it (e.g. with OpenTelemetry tracing/metrics hooks) before use.
+// When provided, RedisURL in the config is not required.
+// The caller retains ownership of the client; Close() will not close it.
+func WithRedisClient(client *redis.Client) ProducerOption {
+	return func(p *RedisSortedSetProducer) error {
+		if client == nil {
+			return errors.New("WithRedisClient: client must not be nil")
+		}
+		p.client = client
+		return nil
+	}
+}
+
+// WithResultClaimLeaseTTL configures the crash-detection window for durable
+// result deliveries. The default is five minutes.
+func WithResultClaimLeaseTTL(ttl time.Duration) ProducerOption {
+	return func(p *RedisSortedSetProducer) error {
+		if ttl <= 0 {
+			return errors.New("WithResultClaimLeaseTTL: duration must be positive")
+		}
+		p.resultClaimLeaseTTL = ttl
+		return nil
+	}
+}
+
+// WithResultClaimReclaimInterval configures how often ReceiveResult checks for
+// pending results and expired claims. The default is one second.
+func WithResultClaimReclaimInterval(interval time.Duration) ProducerOption {
+	return func(p *RedisSortedSetProducer) error {
+		if interval <= 0 {
+			return errors.New("WithResultClaimReclaimInterval: duration must be positive")
+		}
+		p.resultClaimReclaimInterval = interval
+		return nil
+	}
+}
+
+// RedisSortedSetConfig contains configuration for the Redis sorted set producer.
+type RedisSortedSetConfig struct {
+	// RedisURL is a Redis URL (e.g. "redis://user:pass@host:port/db" or "rediss://..." for TLS).
+	// Required unless a client is injected via WithRedisClient.
+	RedisURL string
+
+	// RequestQueueName is the name of the Redis sorted set for requests.
+	// Typically shared across all tenants.
+	// Default: "request-sortedset"
+	RequestQueueName string
+
+	// ResultQueueName is the full Redis list key for results.
+	// Must match the dispatcher/consumer result_queue_name configuration.
+	// Example: "llm-d-async:results:pool-a:$batch"
+	ResultQueueName string
+}
+
+// NewRedisSortedSetProducer creates a new producer using Redis sorted set.
+// Use WithRedisClient to inject a pre-configured client (e.g. with tracing hooks).
+func NewRedisSortedSetProducer(config RedisSortedSetConfig, opts ...ProducerOption) (*RedisSortedSetProducer, error) {
+	if config.ResultQueueName == "" {
+		return nil, errors.New("ResultQueueName is required")
+	}
+
+	if config.RequestQueueName == "" {
+		config.RequestQueueName = "request-sortedset"
+	}
+
+	p := &RedisSortedSetProducer{
+		requestQueueName:           config.RequestQueueName,
+		resultQueueName:            config.ResultQueueName,
+		resultClaimLeaseTTL:        defaultResultClaimLeaseTTL,
+		resultClaimReclaimInterval: defaultResultClaimReclaimInterval,
+	}
+
+	for _, opt := range opts {
+		if err := opt(p); err != nil {
+			return nil, err
+		}
+	}
+
+	if p.client == nil {
+		if config.RedisURL == "" {
+			return nil, errors.New("RedisURL is required when no RedisClient is provided via WithRedisClient")
+		}
+		redisOpts, err := redis.ParseURL(config.RedisURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse RedisURL: %w", err)
+		}
+		p.client = redis.NewClient(redisOpts)
+		p.managedClient = true
+	}
+
+	// Test connection
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := p.client.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
+	}
+
+	return p, nil
+}
+
+// toInternalRequest builds an InternalRequest with routing merged from the concrete
+// *RedisRequest / *PubSubRequest, or a *RequestMessage / default Request message view.
+func toInternalRequest(req api.Request) *api.InternalRequest {
+	ir := &api.InternalRequest{InternalRouting: api.InternalRouting{}}
+	switch v := req.(type) {
+	case *api.RequestMessage:
+		if v == nil {
+			return ir
+		}
+		cp := *v
+		ir.PublicRequest = &cp
+		return ir
+	case *api.RedisRequest:
+		if v == nil {
+			return ir
+		}
+		ir2 := *v
+		if ir2.RequestQueueName != "" {
+			ir.RequestQueueName = ir2.RequestQueueName
+		}
+		if ir2.ResultQueueName != "" {
+			ir.ResultQueueName = ir2.ResultQueueName
+		}
+		ir.PublicRequest = &ir2
+		return ir
+	case *api.PubSubRequest:
+		if v == nil {
+			return ir
+		}
+		ir2 := *v
+		if ir2.PubSubID != "" {
+			ir.TransportCorrelationID = ir2.PubSubID
+		}
+		ir.PublicRequest = &ir2
+		return ir
+	default:
+		ir.PublicRequest = &api.RequestMessage{
+			ID:       req.ReqID(),
+			Created:  req.ReqCreated(),
+			Deadline: req.ReqDeadline(),
+			Payload:  req.ReqPayload(),
+			Metadata: req.ReqMetadata(),
+			Headers:  req.ReqHeaders(),
+			Endpoint: req.ReqEndpoint(),
+			Model:    req.ReqModel(),
+		}
+		return ir
+	}
+}
+
+// SubmitRequest adds a request to the Redis sorted set.
+// The score is the deadline, ensuring earlier deadlines are processed first.
+func (p *RedisSortedSetProducer) SubmitRequest(ctx context.Context, req api.Request) error {
+	if req == nil {
+		return errors.New("request is required")
+	}
+	ir := toInternalRequest(req)
+	r := ir.PublicRequest
+	if r == nil {
+		return errors.New("request is required")
+	}
+
+	if r.ReqID() == "" {
+		return errors.New("request ID is required")
+	}
+
+	deadline := r.ReqDeadline()
+	if deadline <= 0 {
+		return errors.New("deadline is required and must be a positive Unix timestamp")
+	}
+
+	// Apply producer-level defaults for queue routing if not set by caller
+	if ir.ResultQueueName == "" {
+		ir.ResultQueueName = p.resultQueueName
+	}
+
+	if ir.RequestQueueName == "" {
+		ir.RequestQueueName = p.requestQueueName
+	}
+	token, err := newRequestToken()
+	if err != nil {
+		return fmt.Errorf("failed to create request token: %w", err)
+	}
+	ir.RequestToken = token
+	ir.PayloadRef = api.RequestPayloadKey(r.ReqID(), token)
+
+	envelope, payload, err := api.SplitPayload(ir)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Clear any stale cancellation marker for this request ID before enqueue.
+	// This prevents a previously cancelled/completed request ID from poisoning
+	// a later submission that legitimately reuses the same ID.
+	targetQueue := ir.RequestQueueName
+	score := float64(deadline)
+	activeTTL := time.Until(time.Unix(deadline, 0))
+	if activeTTL <= 0 {
+		return errors.New("deadline has already expired")
+	}
+	pipe := p.client.TxPipeline()
+	pipe.Del(ctx, api.RequestCancellationKey(r.ReqID()))
+	pipe.Set(ctx, api.RequestActiveTokenKey(r.ReqID()), ir.RequestToken, activeTTL)
+	pipe.Set(ctx, ir.PayloadRef, []byte(payload), activeTTL+payloadTTLGrace)
+	pipe.ZAdd(ctx, targetQueue, redis.Z{
+		Score:  score,
+		Member: string(envelope),
+	})
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("failed to add request to queue: %w", err)
+	}
+
+	return nil
+}
+
+// CancelRequests marks request IDs as cancelled so dequeue/dispatch paths can drop them.
+func (p *RedisSortedSetProducer) CancelRequests(ctx context.Context, requestIDs []string) error {
+	if len(requestIDs) == 0 {
+		return nil
+	}
+
+	for _, requestID := range requestIDs {
+		if requestID == "" {
+			continue
+		}
+		if _, err := markRequestCancelledScript.Run(
+			ctx,
+			p.client,
+			[]string{api.RequestActiveTokenKey(requestID), api.RequestCancellationKey(requestID)},
+			int(cancellationMarkerTTL/time.Second),
+		).Result(); err != nil {
+			return fmt.Errorf("failed to mark request %q as cancelled: %w", requestID, err)
+		}
+	}
+	return nil
+}
+
+func newRequestToken() (string, error) {
+	token := make([]byte, 16)
+	if _, err := rand.Read(token); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(token), nil
+}
+
+// GetResult retrieves a result from the Redis list, blocking until one is available.
+// Cancellation is checked between one-second blocking waits, so an empty queue
+// can delay observing cancellation by approximately one second.
+func (p *RedisSortedSetProducer) GetResult(ctx context.Context) (*api.ResultMessage, error) {
+	// A zero BRPOP timeout blocks indefinitely: go-redis does not interrupt an
+	// in-flight read when the context is cancelled. Bound each empty wait so we
+	// can check the context without leaving a background pop consuming results.
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("failed to get result: %w", err)
+		}
+		result, err := p.client.BRPop(ctx, time.Second, p.resultQueueName).Result()
+		if errors.Is(err, redis.Nil) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to get result: %w", err)
+		}
+
+		// BRPOP returns [queueName, value]
+		if len(result) != 2 {
+			return nil, errors.New("unexpected BRPOP result format")
+		}
+
+		return p.parseResult(result[1])
+	}
+}
+
+// parseResult parses a JSON result message.
+func (p *RedisSortedSetProducer) parseResult(data string) (*api.ResultMessage, error) {
+	return parseInternalResult(data)
+}
+
+// Close closes the Redis connection if the client was created internally.
+// Externally injected clients (via WithRedisClient) are not closed.
+func (p *RedisSortedSetProducer) Close() error {
+	if p.managedClient {
+		return p.client.Close()
+	}
+	return nil
+}
+
+// RequestQueueDepth returns the number of pending requests in the queue.
+func (p *RedisSortedSetProducer) RequestQueueDepth(ctx context.Context) (int64, error) {
+	return p.client.ZCard(ctx, p.requestQueueName).Result()
+}
+
+// ResultQueueDepth returns the number of results waiting to be consumed.
+func (p *RedisSortedSetProducer) ResultQueueDepth(ctx context.Context) (int64, error) {
+	return p.client.LLen(ctx, p.resultQueueName).Result()
+}
+
+// ClearRequestQueue removes all pending requests from the queue.
+func (p *RedisSortedSetProducer) ClearRequestQueue(ctx context.Context) error {
+	return p.client.Del(ctx, p.requestQueueName).Err()
+}
+
+// ClearResultQueue removes all results from the queue.
+func (p *RedisSortedSetProducer) ClearResultQueue(ctx context.Context) error {
+	keys := newResultClaimKeys(p.resultQueueName)
+	return p.client.Del(ctx, keys.pending, keys.claimed, keys.owners, keys.idx, keys.tombstones).Err()
+}

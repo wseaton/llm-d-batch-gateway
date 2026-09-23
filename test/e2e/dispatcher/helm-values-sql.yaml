@@ -1,0 +1,39 @@
+ap:
+  imagePullPolicy: Never
+  concurrency: 1
+  prometheusCacheTTL: "0s"
+  otel:
+    endpoint: "http://jaeger.default.svc.cluster.local:4317"
+    insecure: true
+    sampler: "always_on"
+    samplerArg: "1.0"
+  metrics:
+    enabled: true
+    port: 9090
+    secure: false
+  transport: "sql"
+  transportConfig:
+    urlSecret:
+      name: "batch-gateway-secrets"
+      key: "postgresql-url"
+    poll_interval_ms: 500
+    batch_size: 10
+    claim_lease_ttl_seconds: 3
+    queues:
+      - queue_name: "llm-d-async:requests:sim-pool"
+        request_path_url: "/v1/completions"
+        igw_base_url: "http://vllm-sim.default.svc.cluster.local:8000"
+        gate_type: "constant"
+        gate_params: {}
+      - queue_name: "llm-d-async:requests:sim-pool-gate"
+        request_path_url: "/v1/completions"
+        igw_base_url: "http://vllm-sim.default.svc.cluster.local:8000"
+        gate_type: "constant"
+        gate_params: {}
+      - queue_name: "llm-d-async:requests:sim-pool-inject"
+        request_path_url: "/v1/completions"
+        igw_base_url: "http://vllm-sim.default.svc.cluster.local:8000"
+        gate_type: "constant"
+        gate_params: {}
+  modelServerMonitor:
+    enabled: false

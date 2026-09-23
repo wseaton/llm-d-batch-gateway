@@ -44,7 +44,19 @@ data:
     dispatch_mode: {{ $dispatchMode | quote }}
     {{- if .Values.processor.config.asyncDispatch }}
     async_dispatch:
+      {{- if .Values.processor.config.asyncDispatch.transport }}
+      transport: {{ .Values.processor.config.asyncDispatch.transport | quote }}
+      {{- end }}
       result_poll_timeout: {{ .Values.processor.config.asyncDispatch.resultPollTimeout | quote }}
+      {{- if .Values.processor.config.asyncDispatch.sql }}
+      sql:
+        {{- if .Values.processor.config.asyncDispatch.sql.submitBatchSize }}
+        submit_batch_size: {{ .Values.processor.config.asyncDispatch.sql.submitBatchSize }}
+        {{- end }}
+        {{- if .Values.processor.config.asyncDispatch.sql.submitLinger }}
+        submit_linger: {{ .Values.processor.config.asyncDispatch.sql.submitLinger | quote }}
+        {{- end }}
+      {{- end }}
       {{- if .Values.processor.config.asyncDispatch.models }}
       models:
         {{- range $model, $cfg := .Values.processor.config.asyncDispatch.models }}

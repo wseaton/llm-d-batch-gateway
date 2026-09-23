@@ -22,14 +22,28 @@ import (
 	"io"
 	"time"
 
+	"context"
+
 	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-async/producer"
+	producersql "github.com/llm-d/llm-d-async/producer-sql"
+	"github.com/llm-d/llm-d-async/producer-sql/sqlqueue"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/syncutil"
 )
 
 const asyncQueuePrefix = "llm-d-async:"
+
+// AsyncTransport selects the llm-d-async transport the producers speak.
+type AsyncTransport string
+
+const (
+	// AsyncTransportRedisSortedSet is the Redis sorted-set transport (default).
+	AsyncTransportRedisSortedSet AsyncTransport = "redis-sortedset"
+	// AsyncTransportSQL is the SQL transport backed by Postgres.
+	AsyncTransportSQL AsyncTransport = "sql"
+)
 
 // AsyncModelPoolConfig holds the resolved pool and queue settings for one async model.
 type AsyncModelPoolConfig struct {
@@ -40,8 +54,10 @@ type AsyncModelPoolConfig struct {
 
 // AsyncClientConfig holds the resolved configuration for async dispatch.
 type AsyncClientConfig struct {
-	RedisURL          string
-	ConsumerID        string // identity of this Batch Processor replica
+	Transport         AsyncTransport // empty means redis-sortedset
+	RedisURL          string         // redis-sortedset transport
+	SQLURL            string         // sql transport DSN (postgres:// or sqlite://)
+	ConsumerID        string         // identity of this Batch Processor replica
 	Models            map[string]AsyncModelPoolConfig
 	ResultPollTimeout time.Duration // per-poll timeout in the result dispatcher loop
 }
@@ -118,24 +134,21 @@ func NewAsyncResolver(config AsyncClientConfig, logger logr.Logger) (*AsyncGatew
 		return nil, fmt.Errorf("consumerID must not be empty")
 	}
 
-	opts, err := redis.ParseURL(config.RedisURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse async inference Redis URL: %w", err)
-	}
-	rdb := redis.NewClient(opts)
-
 	poolToModel := make(map[string]string, len(config.Models))
 	for model, mcfg := range config.Models {
 		if existing, ok := poolToModel[mcfg.PoolName]; ok {
-			_ = rdb.Close()
 			return nil, fmt.Errorf("models %q and %q both map to pool %q: each pool must have a single consumer", existing, model, mcfg.PoolName)
 		}
 		poolToModel[mcfg.PoolName] = model
 	}
 
 	if config.ResultPollTimeout <= 0 {
-		_ = rdb.Close()
 		return nil, fmt.Errorf("resultPollTimeout must be > 0")
+	}
+
+	newProducer, conn, err := newAsyncProducerFactory(config)
+	if err != nil {
+		return nil, err
 	}
 
 	pools := make(map[string]*asyncPool, len(config.Models))
@@ -162,18 +175,12 @@ func NewAsyncResolver(config AsyncClientConfig, logger logr.Logger) (*AsyncGatew
 			"resultQueue", resQueue,
 		)
 
-		p, err := producer.NewRedisSortedSetProducer(
-			producer.RedisSortedSetConfig{
-				RequestQueueName: reqQueue,
-				ResultQueueName:  resQueue,
-			},
-			producer.WithRedisClient(rdb),
-		)
+		p, err := newProducer(reqQueue, resQueue)
 		if err != nil {
 			for _, c := range closers {
 				_ = c.Close()
 			}
-			_ = rdb.Close()
+			_ = conn.Close()
 			return nil, fmt.Errorf("failed to create producer for model %q (pool %s): %w", model, mcfg.PoolName, err)
 		}
 
@@ -184,7 +191,7 @@ func NewAsyncResolver(config AsyncClientConfig, logger logr.Logger) (*AsyncGatew
 		closers = append(closers, p)
 	}
 
-	closers = append(closers, rdb)
+	closers = append(closers, conn)
 
 	return &AsyncGatewayResolver{
 		pools:         pools,
@@ -192,4 +199,40 @@ func NewAsyncResolver(config AsyncClientConfig, logger logr.Logger) (*AsyncGatew
 		closers:       closers,
 		logger:        logger,
 	}, nil
+}
+
+// newAsyncProducerFactory opens the transport connection shared by every
+// per-model producer and returns a constructor for them. The connection is
+// closed by the caller after the producers.
+func newAsyncProducerFactory(config AsyncClientConfig) (func(reqQueue, resQueue string) (producer.Producer, error), io.Closer, error) {
+	switch config.Transport {
+	case "", AsyncTransportRedisSortedSet:
+		opts, err := redis.ParseURL(config.RedisURL)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to parse async inference Redis URL: %w", err)
+		}
+		rdb := redis.NewClient(opts)
+		return func(reqQueue, resQueue string) (producer.Producer, error) {
+			return producer.NewRedisSortedSetProducer(
+				producer.RedisSortedSetConfig{RequestQueueName: reqQueue, ResultQueueName: resQueue},
+				producer.WithRedisClient(rdb),
+			)
+		}, rdb, nil
+	case AsyncTransportSQL:
+		if config.SQLURL == "" {
+			return nil, nil, fmt.Errorf("async inference sql transport requires a SQL URL")
+		}
+		store, err := sqlqueue.Open(context.Background(), config.SQLURL)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to open async inference SQL store: %w", err)
+		}
+		return func(reqQueue, resQueue string) (producer.Producer, error) {
+			return producersql.New(context.Background(),
+				producersql.Config{RequestQueueName: reqQueue, ResultQueueName: resQueue},
+				producersql.WithStore(store),
+			)
+		}, store, nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported async inference transport %q (supported: %s, %s)", config.Transport, AsyncTransportRedisSortedSet, AsyncTransportSQL)
+	}
 }

@@ -343,7 +343,14 @@ processor:
     # gateway over HTTP; "async" queues requests for llm-d-async.
     dispatchMode: "sync"
     asyncDispatch:
+      # llm-d-async transport: "redis-sortedset" (default, uses the redis-url
+      # secret key) or "sql" (shares the postgresql-url secret key with the
+      # batch database).
+      transport: ""
       resultPollTimeout: "30s"
+      # sql transport only: submitBatchSize (requests enqueued per statement,
+      # default 256) and submitLinger (how long a partial batch waits, default 25ms).
+      sql: {}
       models: {}
 
     # Sync mode: configure exactly one of globalInferenceGateway or modelGateways.

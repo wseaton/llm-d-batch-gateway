@@ -14,8 +14,9 @@ require (
 	github.com/go-resty/resty/v2 v2.17.2
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/llm-d/llm-d-async/api v0.9.1
+	github.com/llm-d/llm-d-async/api v0.10.0
 	github.com/llm-d/llm-d-async/producer v0.9.1
+	github.com/llm-d/llm-d-async/producer-sql v0.0.0-00010101000000-000000000000
 	github.com/pashagolub/pgxmock/v5 v5.2.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/quasilyte/go-ruleguard/dsl v0.3.23
@@ -113,6 +114,12 @@ require (
 	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
+
+replace github.com/llm-d/llm-d-async/api => ./internal/llm-d-async/api
+
+replace github.com/llm-d/llm-d-async/producer => ./internal/llm-d-async/producer
+
+replace github.com/llm-d/llm-d-async/producer-sql => ./internal/llm-d-async/producer-sql

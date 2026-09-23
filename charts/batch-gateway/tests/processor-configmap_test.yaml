@@ -416,6 +416,20 @@ tests:
           path: data["config.yaml"]
           pattern: '"sim-model-inject":[\s\S]*inference_pool_name: "sim-pool-inject"'
 
+  - it: should render async_dispatch.transport when configured
+    set:
+      processor.config.dispatchMode: async
+      processor.config.asyncDispatch:
+        transport: sql
+        resultPollTimeout: "30s"
+        models:
+          "sim-model":
+            inferencePoolName: "sim-pool"
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'async_dispatch:\s*\n\s*transport: "sql"'
+
   - it: should not render send_fairness_header when false (default)
     asserts:
       - notMatchRegex:

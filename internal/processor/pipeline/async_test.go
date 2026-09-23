@@ -23,6 +23,7 @@ type fakeAsyncClient struct {
 	mu           sync.Mutex
 	submitted    []*inference.GenerateRequest
 	submittedCh  chan struct{}
+	batchSizes   []int
 	results      chan *inference.GenerateResponse
 	cancelledIDs []string
 }
@@ -46,6 +47,22 @@ func (c *fakeAsyncClient) Submit(ctx context.Context, req *inference.GenerateReq
 		}
 	}
 	return nil
+}
+
+func (c *fakeAsyncClient) SubmitBatch(ctx context.Context, reqs []*inference.GenerateRequest) []*inference.ClientError {
+	c.mu.Lock()
+	c.submitted = append(c.submitted, reqs...)
+	c.batchSizes = append(c.batchSizes, len(reqs))
+	c.mu.Unlock()
+	if c.submittedCh != nil {
+		for range reqs {
+			select {
+			case c.submittedCh <- struct{}{}:
+			case <-ctx.Done():
+			}
+		}
+	}
+	return make([]*inference.ClientError, len(reqs))
 }
 
 func (c *fakeAsyncClient) GetResult(ctx context.Context) (*inference.GenerateResponse, error) {
@@ -112,7 +129,7 @@ func TestAsyncEndToEnd(t *testing.T) {
 
 	dispatcher := NewAsyncDispatcher(resolver,
 		broadcasters,
-		pending, logr.Discard())
+		pending, defaultSubmitBatchSize, defaultSubmitLinger, logr.Discard())
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
@@ -380,6 +397,10 @@ func (c *fakeAsyncClientWithErrors) Submit(_ context.Context, _ *inference.Gener
 	return nil
 }
 
+func (c *fakeAsyncClientWithErrors) SubmitBatch(_ context.Context, reqs []*inference.GenerateRequest) []*inference.ClientError {
+	return make([]*inference.ClientError, len(reqs))
+}
+
 func (c *fakeAsyncClientWithErrors) GetResult(ctx context.Context) (*inference.GenerateResponse, error) {
 	return c.getResult(ctx)
 }
@@ -414,7 +435,7 @@ func TestAsyncDispatcher_ParseError(t *testing.T) {
 
 	dispatcher := NewPreDispatcher(NewAsyncDispatcher(resolver,
 		broadcasters,
-		pending, logr.Discard()))
+		pending, defaultSubmitBatchSize, defaultSubmitLinger, logr.Discard()))
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
@@ -488,7 +509,7 @@ func TestAsyncDispatcher_ModelNotFound(t *testing.T) {
 
 	dispatcher := NewAsyncDispatcher(resolver,
 		broadcasters,
-		pending, logr.Discard())
+		pending, defaultSubmitBatchSize, defaultSubmitLinger, logr.Discard())
 
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
@@ -605,7 +626,7 @@ func TestAsyncCancellation(t *testing.T) {
 			errorFile := tempFile(t)
 			tracker := NewProgressTracker(int64(len(items)), nil, "test-job", 0, logr.Discard())
 			collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
-			dispatcher := NewAsyncDispatcher(resolver, broadcasters, pending, logr.Discard())
+			dispatcher := NewAsyncDispatcher(resolver, broadcasters, pending, defaultSubmitBatchSize, defaultSubmitLinger, logr.Discard())
 			deliveryDone := make(chan struct{})
 			executor := NewJobExecutor(JobExecutorConfig{
 				Source: requestSourceFunc(func(ctx context.Context, out chan<- RequestItem) error {
@@ -722,4 +743,125 @@ func TestAsyncCancellation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAsyncDispatcher_BatchesSubmits(t *testing.T) {
+	client := newFakeAsyncClient()
+	resolver := inference.NewTestAsyncResolver(map[string]func() inference.AsyncInferenceClient{
+		"m1": func() inference.AsyncInferenceClient { return client },
+	})
+	defer func() { _ = resolver.Close() }()
+
+	const total = 1000
+	requestCh := make(chan RequestItem, total)
+	for i := 0; i < total; i++ {
+		requestCh <- RequestItem{
+			RequestID: fmt.Sprintf("req-%d", i),
+			CustomID:  fmt.Sprintf("c-%d", i),
+			ModelID:   "m1",
+			Endpoint:  "/v1/chat/completions",
+		}
+	}
+	close(requestCh)
+
+	resultCh := make(chan ResultItem, total)
+	dispatcher := NewAsyncDispatcher(resolver, NewBroadcasterGroup(nil), NewPendingRequests(0), defaultSubmitBatchSize, defaultSubmitLinger, logr.Discard())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go func() { _ = dispatcher.Run(ctx, requestCh, resultCh) }()
+
+	deadline := time.After(10 * time.Second)
+	for {
+		client.mu.Lock()
+		got := len(client.submitted)
+		client.mu.Unlock()
+		if got >= total {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("only %d of %d requests submitted", got, total)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.submitted) != total {
+		t.Fatalf("submitted %d requests, want %d", len(client.submitted), total)
+	}
+	// A full channel must coalesce; one call per request is the bug this guards.
+	if len(client.batchSizes) >= total {
+		t.Fatalf("made %d submit calls for %d requests, expected coalescing", len(client.batchSizes), total)
+	}
+	biggest := 0
+	for _, n := range client.batchSizes {
+		if n > biggest {
+			biggest = n
+		}
+		if n > defaultSubmitBatchSize {
+			t.Fatalf("batch of %d exceeds cap %d", n, defaultSubmitBatchSize)
+		}
+	}
+	if biggest < 2 {
+		t.Fatalf("largest batch was %d, expected coalescing", biggest)
+	}
+	t.Logf("%d requests in %d calls, largest batch %d", total, len(client.batchSizes), biggest)
+}
+
+// The upstream channel is unbuffered, so requests arrive one at a time with a
+// gap between them. Without a linger window every request gets its own INSERT,
+// which is the regression this guards.
+func TestAsyncDispatcher_BatchesDrippedSubmits(t *testing.T) {
+	client := newFakeAsyncClient()
+	resolver := inference.NewTestAsyncResolver(map[string]func() inference.AsyncInferenceClient{
+		"m1": func() inference.AsyncInferenceClient { return client },
+	})
+	defer func() { _ = resolver.Close() }()
+
+	const total = 300
+	requestCh := make(chan RequestItem)
+	resultCh := make(chan ResultItem, total)
+	dispatcher := NewAsyncDispatcher(resolver, NewBroadcasterGroup(nil), NewPendingRequests(0), defaultSubmitBatchSize, defaultSubmitLinger, logr.Discard())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	go func() { _ = dispatcher.Run(ctx, requestCh, resultCh) }()
+
+	go func() {
+		for i := 0; i < total; i++ {
+			requestCh <- RequestItem{
+				RequestID: fmt.Sprintf("req-%d", i),
+				CustomID:  fmt.Sprintf("c-%d", i),
+				ModelID:   "m1",
+				Endpoint:  "/v1/chat/completions",
+			}
+			time.Sleep(time.Millisecond)
+		}
+		close(requestCh)
+	}()
+
+	deadline := time.After(30 * time.Second)
+	for {
+		client.mu.Lock()
+		got := len(client.submitted)
+		client.mu.Unlock()
+		if got >= total {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("only %d of %d requests submitted", got, total)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	calls := len(client.batchSizes)
+	if calls >= total {
+		t.Fatalf("made %d submit calls for %d dripped requests, expected coalescing", calls, total)
+	}
+	t.Logf("%d dripped requests in %d calls (avg %.1f per call)", total, calls, float64(total)/float64(calls))
 }

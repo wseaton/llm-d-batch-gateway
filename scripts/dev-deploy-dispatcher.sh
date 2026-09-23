@@ -23,6 +23,11 @@ PID_FILE="${REPO_ROOT}/.dispatcher-port-forward.pid"
 # instead of pulling a released image. The local chart is used automatically.
 # Example: DISPATCHER_SOURCE=~/src/llm-d-async ENABLE_DISPATCHER=true make dev-deploy
 DISPATCHER_SOURCE="${DISPATCHER_SOURCE:-}"
+# DISPATCHER_TRANSPORT=sql additionally deploys a dispatcher on the sql
+# transport (sharing the batch-gateway Postgres) and switches the processor's
+# async producers to it. Default: redis-sortedset.
+DISPATCHER_TRANSPORT="${DISPATCHER_TRANSPORT:-redis-sortedset}"
+DISPATCHER_SQL_RELEASE="${DISPATCHER_SQL_RELEASE:-dispatcher-sql}"
 
 # ── Prerequisites (standalone only — dev-deploy.sh already checks these) ─────
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -45,7 +50,13 @@ if [[ -n "${DISPATCHER_SOURCE}" ]]; then
     DISPATCHER_CHART="${DISPATCHER_SOURCE}/charts/llm-d-async"
     unset DISPATCHER_CHART_VERSION
     step "Building async-processor image from ${DISPATCHER_SOURCE}..."
-    ${CONTAINER_TOOL} build -t "${DISPATCHER_IMAGE}" "${DISPATCHER_SOURCE}"
+    BUILD_LOAD_FLAG=()
+    if [[ "${CONTAINER_TOOL}" == "docker" ]]; then
+        # A buildx container driver keeps the result in its cache unless asked
+        # to load it into the local image store.
+        BUILD_LOAD_FLAG=(--load)
+    fi
+    ${CONTAINER_TOOL} build ${BUILD_LOAD_FLAG[@]+"${BUILD_LOAD_FLAG[@]}"} -t "${DISPATCHER_IMAGE}" "${DISPATCHER_SOURCE}"
 else
     step "Using registry dispatcher image ${DISPATCHER_IMAGE}"
 fi
@@ -101,7 +112,7 @@ fi
 
 step "Deploying async-processor with redis gate (release: ${DISPATCHER_RELEASE})..."
 helm upgrade --install "${DISPATCHER_RELEASE}" "${DISPATCHER_CHART}" \
-    "${HELM_VERSION_FLAG[@]}" \
+    ${HELM_VERSION_FLAG[@]+"${HELM_VERSION_FLAG[@]}"} \
     --namespace "${NAMESPACE}" \
     --values "${HELM_VALUES}" \
     --set-string "ap.image.repository=${DISPATCHER_IMAGE_REPO}" \
@@ -111,7 +122,7 @@ helm upgrade --install "${DISPATCHER_RELEASE}" "${DISPATCHER_CHART}" \
 
 step "Deploying async-processor with endpoint-scrape gate (release: ${DISPATCHER_SCRAPE_RELEASE})..."
 helm upgrade --install "${DISPATCHER_SCRAPE_RELEASE}" "${DISPATCHER_CHART}" \
-    "${HELM_VERSION_FLAG[@]}" \
+    ${HELM_VERSION_FLAG[@]+"${HELM_VERSION_FLAG[@]}"} \
     --namespace "${NAMESPACE}" \
     --values "${HELM_VALUES_SCRAPE}" \
     --set-string "ap.image.repository=${DISPATCHER_IMAGE_REPO}" \
@@ -124,13 +135,27 @@ HELM_VALUES_PROM="${REPO_ROOT}/test/e2e/dispatcher/helm-values-prometheus.yaml"
 
 step "Deploying async-processor with prometheus-query gate (release: ${DISPATCHER_PROM_RELEASE})..."
 helm upgrade --install "${DISPATCHER_PROM_RELEASE}" "${DISPATCHER_CHART}" \
-    "${HELM_VERSION_FLAG[@]}" \
+    ${HELM_VERSION_FLAG[@]+"${HELM_VERSION_FLAG[@]}"} \
     --namespace "${NAMESPACE}" \
     --values "${HELM_VALUES_PROM}" \
     --set-string "ap.image.repository=${DISPATCHER_IMAGE_REPO}" \
     --set-string "ap.image.tag=${DISPATCHER_IMAGE_TAG}" \
     --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
     --timeout=120s
+
+if [[ "${DISPATCHER_TRANSPORT}" == "sql" ]]; then
+    HELM_VALUES_SQL="${REPO_ROOT}/test/e2e/dispatcher/helm-values-sql.yaml"
+    step "Deploying async-processor with sql transport (release: ${DISPATCHER_SQL_RELEASE})..."
+    helm upgrade --install "${DISPATCHER_SQL_RELEASE}" "${DISPATCHER_CHART}" \
+        ${HELM_VERSION_FLAG[@]+"${HELM_VERSION_FLAG[@]}"} \
+        --namespace "${NAMESPACE}" \
+        --values "${HELM_VALUES_SQL}" \
+        --set-string "ap.transportConfig.urlSecret.name=${APP_SECRET_NAME}" \
+        --set-string "ap.image.repository=${IMAGE_REPO}" \
+        --set-string "ap.image.tag=${IMAGE_TAG}" \
+        --set-string "ap.imagePullPolicy=${DISPATCHER_IMAGE_PULL_POLICY}" \
+        --timeout=120s
+fi
 
 log "Dispatchers deployed."
 
@@ -172,6 +197,11 @@ verify_dispatcher_runtime_image() {
 verify_dispatcher_runtime_image "${DISPATCHER_RELEASE}"
 verify_dispatcher_runtime_image "${DISPATCHER_SCRAPE_RELEASE}"
 verify_dispatcher_runtime_image "${DISPATCHER_PROM_RELEASE}"
+if [[ "${DISPATCHER_TRANSPORT}" == "sql" ]]; then
+    kubectl wait --for=condition=available deployment/"${DISPATCHER_SQL_RELEASE}-llm-d-async" \
+        --namespace "${NAMESPACE}" --timeout=60s
+    verify_dispatcher_runtime_image "${DISPATCHER_SQL_RELEASE}"
+fi
 
 # ── Add vllm-sim to Prometheus scrape targets ────────────────────────────────
 step "Adding vllm-sim to Prometheus scrape config..."
@@ -208,6 +238,9 @@ fi
 # ── Reconfigure processor for async dispatch ─────────────────────────────────
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     PROCESSOR_ASYNC_VALUES="${REPO_ROOT}/test/e2e/dispatcher/processor-async-values.yaml"
+    if [[ "${DISPATCHER_TRANSPORT}" == "sql" ]]; then
+        PROCESSOR_ASYNC_VALUES="${REPO_ROOT}/test/e2e/dispatcher/processor-async-sql-values.yaml"
+    fi
 
     step "Reconfiguring batch-gateway processor for async dispatch..."
 

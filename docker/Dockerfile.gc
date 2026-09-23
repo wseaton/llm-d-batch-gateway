@@ -5,6 +5,7 @@ ARG TARGETARCH
 WORKDIR /workspace
 COPY go.mod go.mod
 COPY go.sum go.sum
+COPY internal/llm-d-async/ internal/llm-d-async/
 RUN go mod download
 
 COPY cmd/batch-gc/ cmd/batch-gc/

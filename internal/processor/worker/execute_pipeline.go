@@ -173,7 +173,16 @@ func (p *Processor) buildRequestDispatcher(modelMap *modelMapFile, pending *pipe
 	switch {
 	case p.asyncInference != nil:
 		broadcasters := p.broadcasters.forModels(modelMap)
-		async := pipeline.NewAsyncDispatcher(p.asyncInference, broadcasters, pending, logger)
+		// Only the sql producer enqueues a batch in one statement. On any other
+		// transport SubmitBatch loops per request, so accumulating would add the
+		// linger's latency for nothing.
+		submitBatch, submitLinger := 1, time.Duration(0)
+		if p.cfg.AsyncDispatchConfig.Transport == inference.AsyncTransportSQL {
+			submitBatch = p.cfg.AsyncDispatchConfig.SQL.SubmitBatchSize
+			submitLinger = p.cfg.AsyncDispatchConfig.SQL.SubmitLinger
+		}
+		async := pipeline.NewAsyncDispatcher(p.asyncInference, broadcasters, pending,
+			submitBatch, submitLinger, logger)
 		return pipeline.NewPreDispatcher(async), nil
 	case p.cfg.Concurrency.AIMD.Enabled:
 		models := buildAIMDModels(modelMap, p.inference, p.endpointLimits, p.cfg.RouteKeyMethod, tenantID)

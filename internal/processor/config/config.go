@@ -139,10 +139,18 @@ type AsyncModelConfig struct {
 // AsyncDispatchConfig holds configuration for the llm-d-async dispatch backend.
 // Only used when DispatchMode == "async".
 type AsyncDispatchConfig struct {
+	// Transport selects the llm-d-async transport: "redis-sortedset" (default)
+	// or "sql".
+	Transport inference.AsyncTransport `yaml:"transport"`
+
 	// RedisURL is the full Redis connection URL (e.g. "redis://host:6379",
 	// "rediss://user:pass@host:6379" for TLS). Read from the mounted secret
 	// at runtime (SecretKeyRedisURL)
 	RedisURL string `yaml:"-"`
+
+	// SQLURL is the database DSN for the sql transport. Read from the
+	// mounted secret at runtime (SecretKeyPostgreSQLURL).
+	SQLURL string `yaml:"-"`
 
 	// ResultPollTimeout is the timeout per GetResult poll cycle.
 	// Controls how long each blocking poll waits before retrying.
@@ -151,6 +159,24 @@ type AsyncDispatchConfig struct {
 	// Models maps model names to their async dispatch targets.
 	// Required when DispatchMode == "async".
 	Models map[string]AsyncModelConfig `yaml:"models"`
+
+	// SQL holds settings that apply only to the sql transport.
+	SQL SQLDispatchConfig `yaml:"sql"`
+}
+
+// SQLDispatchConfig tunes the sql transport's enqueue path. Only the sql
+// producer enqueues a batch in one statement, so batching these settings
+// describe is meaningless — and its linger actively harmful — on a transport
+// that submits one request at a time.
+type SQLDispatchConfig struct {
+	// SubmitBatchSize bounds how many requests are enqueued in one call.
+	// Zero uses the default.
+	SubmitBatchSize int `yaml:"submit_batch_size"`
+
+	// SubmitLinger is how long a partial submit batch waits for more requests.
+	// The upstream channel is unbuffered, so without it a batch closes in the
+	// gap between two sends and every request costs its own enqueue.
+	SubmitLinger time.Duration `yaml:"submit_linger"`
 }
 
 type ProcessorConfig struct {
@@ -403,6 +429,10 @@ func NewConfig() *ProcessorConfig {
 		DispatchMode: DispatchModeSync,
 		AsyncDispatchConfig: AsyncDispatchConfig{
 			ResultPollTimeout: 5 * time.Second,
+			SQL: SQLDispatchConfig{
+				SubmitBatchSize: 256,
+				SubmitLinger:    25 * time.Millisecond,
+			},
 		},
 	}
 }
@@ -542,6 +572,17 @@ func (c *ProcessorConfig) validateSyncDispatchConfig() error {
 func (c *ProcessorConfig) validateAsyncDispatchConfig() error {
 	if c.AsyncDispatchConfig.ResultPollTimeout <= 0 {
 		return fmt.Errorf("async_dispatch.result_poll_timeout must be > 0")
+	}
+	if c.AsyncDispatchConfig.SQL.SubmitBatchSize < 0 {
+		return fmt.Errorf("async_dispatch.sql.submit_batch_size must not be negative")
+	}
+	if c.AsyncDispatchConfig.SQL.SubmitLinger < 0 {
+		return fmt.Errorf("async_dispatch.sql.submit_linger must not be negative")
+	}
+	switch c.AsyncDispatchConfig.Transport {
+	case "", inference.AsyncTransportRedisSortedSet, inference.AsyncTransportSQL:
+	default:
+		return fmt.Errorf("async_dispatch.transport must be one of %q, %q", inference.AsyncTransportRedisSortedSet, inference.AsyncTransportSQL)
 	}
 	if c.GlobalInferenceGateway != nil {
 		return fmt.Errorf("global_inference_gateway is not supported with dispatch_mode %q; use async_dispatch.models instead or explicitly set dispatch_mode: sync", DispatchModeAsync)
@@ -706,6 +747,7 @@ func ResolveModelGateways(cfg *ProcessorConfig) (*ResolvedGateways, error) {
 			}
 		}
 		result.Async = &inference.AsyncClientConfig{
+			Transport:         cfg.AsyncDispatchConfig.Transport,
 			Models:            models,
 			ResultPollTimeout: cfg.AsyncDispatchConfig.ResultPollTimeout,
 		}
