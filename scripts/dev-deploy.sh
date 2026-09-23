@@ -1148,7 +1148,11 @@ install_batch_gateway() {
     )
 
     if [ "${ENABLE_DISPATCHER}" = "true" ]; then
-        helm_args+=(--values "${REPO_ROOT}/test/e2e/dispatcher/processor-async-values.yaml")
+        local async_values="${REPO_ROOT}/test/e2e/dispatcher/processor-async-values.yaml"
+        if [ "${DISPATCHER_TRANSPORT}" = "sql" ]; then
+            async_values="${REPO_ROOT}/test/e2e/dispatcher/processor-async-sql-values.yaml"
+        fi
+        helm_args+=(--values "${async_values}")
     else
         helm_args+=(
             --set processor.config.dispatchMode=sync

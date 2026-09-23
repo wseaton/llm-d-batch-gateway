@@ -276,10 +276,12 @@ check-container-tool:
 	  echo "❌ $(CONTAINER_TOOL) is not installed."; \
 	  echo "🔧 Try: sudo apt install $(CONTAINER_TOOL) OR brew install $(CONTAINER_TOOL)"; exit 1; }
 
+BUILD_LOAD_FLAG = $(if $(filter docker,$(CONTAINER_TOOL)),--load,)
+
 ## image-build-apiserver: Build apiserver Docker image
 image-build-apiserver: check-container-tool
 	@printf "\033[33;1m==== Building Docker image $(APISERVER_IMG) ====\033[0m\n"
-	$(CONTAINER_TOOL) build \
+	$(CONTAINER_TOOL) build $(BUILD_LOAD_FLAG) \
 		--platform linux/$(TARGETARCH) \
 		--build-arg TARGETOS=linux \
 		--build-arg TARGETARCH=$(TARGETARCH) \
@@ -289,7 +291,7 @@ image-build-apiserver: check-container-tool
 ## image-build-processor: Build processor Docker image
 image-build-processor: check-container-tool
 	@printf "\033[33;1m==== Building Docker image $(PROCESSOR_IMG) ====\033[0m\n"
-	$(CONTAINER_TOOL) build \
+	$(CONTAINER_TOOL) build $(BUILD_LOAD_FLAG) \
 		--platform linux/$(TARGETARCH) \
 		--build-arg TARGETOS=linux \
 		--build-arg TARGETARCH=$(TARGETARCH) \
@@ -299,7 +301,7 @@ image-build-processor: check-container-tool
 ## image-build-gc: Build garbage collector Docker image
 image-build-gc: check-container-tool
 	@printf "\033[33;1m==== Building Docker image $(GC_IMG) ====\033[0m\n"
-	$(CONTAINER_TOOL) build \
+	$(CONTAINER_TOOL) build $(BUILD_LOAD_FLAG) \
 		--platform linux/$(TARGETARCH) \
 		--build-arg TARGETOS=linux \
 		--build-arg TARGETARCH=$(TARGETARCH) \
