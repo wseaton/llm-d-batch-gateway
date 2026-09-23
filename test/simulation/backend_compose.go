@@ -63,6 +63,10 @@ func newComposeBackend(t *testing.T) *composeBackend {
 	}
 	b.downAll()
 	t.Cleanup(func() {
+		if os.Getenv("SIM_KEEP_STACK") == "1" {
+			t.Logf("SIM_KEEP_STACK=1: leaving compose project %s up", composeProject)
+			return
+		}
 		b.downAll()
 		b.stopHostVCR()
 	})
@@ -91,10 +95,13 @@ func (b *composeBackend) restart(service string) {
 func (b *composeBackend) downAll() {
 	b.t.Helper()
 	// A paused container cannot be stopped or removed.
-	if id := b.containerID("processor"); id != "" {
+	out, _ := exec.Command("docker", "ps", "-q",
+		"--filter", "label=com.docker.compose.project="+composeProject,
+		"--filter", "status=paused").Output()
+	for _, id := range strings.Fields(string(out)) {
 		_ = exec.Command("docker", "unpause", id).Run()
 	}
-	b.compose("rm", "-sf", "processor-1", "processor-2", "processor-zombie")
+	b.compose("rm", "-sf", "processor-1", "processor-2", "processor-zombie", "dispatcher-1")
 	b.compose("down", "-v", "--remove-orphans")
 }
 
@@ -182,8 +189,20 @@ func (b *composeBackend) inferenceRequests() (int, bool) {
 	return strings.Count(string(out), vcrRequestLogLine), true
 }
 
+func (b *composeBackend) sql(query string) (string, bool) {
+	id := b.containerID("postgres")
+	if id == "" {
+		return "", false
+	}
+	out, err := exec.Command("docker", "exec", id, "psql", "-U", "sim", "-d", "batchgw", "-v", "ON_ERROR_STOP=1", "-tAc", query).CombinedOutput()
+	if err != nil {
+		b.t.Fatalf("psql %q: %v\n%s", query, err, out)
+	}
+	return strings.TrimSpace(string(out)), true
+}
+
 func (b *composeBackend) dumpLogs() string {
-	cmd := b.composeArgs("logs", "--no-color", "--tail", "200", "apiserver", "processor", "processor-1", "processor-2", "processor-zombie", "gc")
+	cmd := b.composeArgs("logs", "--no-color", "--tail", "200", "apiserver", "processor", "processor-1", "processor-2", "processor-zombie", "gc", "dispatcher", "dispatcher-1")
 	out, _ := cmd.CombinedOutput()
 	return string(out)
 }
@@ -215,7 +234,7 @@ func (b *composeBackend) vcrImage() string {
 	if img := os.Getenv("VCR_IMAGE"); img != "" {
 		return img
 	}
-	return "ghcr.io/neuralmagic/vllm-vcr:dev"
+	return "ghcr.io/neuralmagic/vllm-vcr:0.2.2-vllm0.27"
 }
 
 func (b *composeBackend) composeArgs(args ...string) *exec.Cmd {
@@ -238,7 +257,7 @@ func (b *composeBackend) compose(args ...string) {
 	cmd := b.composeArgs(args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		b.t.Fatalf("%s failed: %v\n%s", strings.Join(cmd.Args, " "), err, out)
+		b.t.Fatalf("%s failed: %v\n%s\n=== component logs ===\n%s", strings.Join(cmd.Args, " "), err, out, b.dumpLogs())
 	}
 }
 

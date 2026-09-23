@@ -30,26 +30,18 @@ import (
 // TestAsyncResultDestruction reproduces this failure: in async dispatch
 // the processor submits requests fire-and-forget with an in-memory pending
 // map as the only record, and long-lived ResultBroadcasters pop results from
-// the shared Redis result queue destructively. Kill the processor after
-// submission: the pending map dies with it, the replacement starts fresh
-// broadcasters with no subscribers, and when the results arrive they are
-// popped and discarded. The reconciler terminalizes the orphan as failed.
+// its result route destructively. Kill the processor after submission: the
+// pending map dies with it, the replacement starts fresh broadcasters with no
+// subscribers, and when the results arrive they are popped and discarded. The
+// reconciler terminalizes the orphan as failed.
 //
 // Violated invariant (work conservation): inference that was paid for and
 // whose results were durably produced must not be silently destroyed.
 func TestAsyncResultDestruction(t *testing.T) {
 	const scenario = "async_result_destruction"
 	const lines = 4
-	if backendName() != "compose" {
-		t.Skip("async scenarios need the harness-run queue consumer; compose only")
-	}
-	h := newHarness(t, map[string]string{
-		"PROCESSOR_CONFIG": "processor-async.yaml",
-	})
+	h := asyncHarness(t)
 	baseline := h.inferenceWitness()
-	ctx, cancelBridge := context.WithCancel(context.Background())
-	defer cancelBridge()
-	bridge := startAsyncBridge(ctx, t)
 	client := newAPIClient()
 
 	// ~9s generations so the kill lands after submission, before results.
@@ -86,13 +78,13 @@ func TestAsyncResultDestruction(t *testing.T) {
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
 		served = h.inferenceWitness() - baseline
-		if served >= lines && bridge.resultQueueLen(ctx) == 0 {
+		if served >= lines && h.sqlInt(`SELECT count(*) FROM async_results`) == 0 {
 			break
 		}
 		time.Sleep(2 * time.Second)
 	}
 	time.Sleep(5 * time.Second) // let the broadcaster pop stragglers
-	remaining := bridge.resultQueueLen(ctx)
+	remaining := h.sqlInt(`SELECT count(*) FROM async_results`)
 	h.rec.event("witness", map[string]any{"served": served, "resultsRemaining": remaining})
 	time.Sleep(1 * time.Second)
 	cancelObs()
@@ -100,7 +92,7 @@ func TestAsyncResultDestruction(t *testing.T) {
 	destroyed := final.Status == openai.BatchStatusFailed &&
 		final.OutputFileID == nil && final.ErrorFileID == nil &&
 		served >= lines && remaining == 0
-	detail := fmt.Sprintf("observed sequence %v, final %s, engine served %d/%d, results left unconsumed %d, %s",
-		tl.statuses(), final.Status, served, lines, remaining, bridge)
+	detail := fmt.Sprintf("observed sequence %v, final %s, engine served %d/%d, results left unconsumed %d",
+		tl.statuses(), final.Status, served, lines, remaining)
 	judge(t, scenario, destroyed, detail)
 }

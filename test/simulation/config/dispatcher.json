@@ -1,0 +1,14 @@
+{
+  "result_queue_name": "llm-d-async:results:sim-pool",
+  "poll_interval_ms": 100,
+  "batch_size": 32,
+  "lease_ttl_seconds": 3,
+  "handoff_timeout_seconds": 30,
+  "queues": [
+    {
+      "queue_name": "llm-d-async:requests:sim-pool",
+      "request_path_url": "/v1/chat/completions",
+      "igw_base_url": "http://toxiproxy:58000"
+    }
+  ]
+}

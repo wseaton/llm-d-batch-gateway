@@ -311,3 +311,5 @@ func (b *kindBackend) harvest(dir string, start time.Time) {
 	}
 	b.t.Logf("harvested jaeger traces into %s", dir)
 }
+
+func (b *kindBackend) sql(string) (string, bool) { return "", false }

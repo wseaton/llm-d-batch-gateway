@@ -70,6 +70,17 @@ func newHarness(t *testing.T, env map[string]string) *harness {
 	return h
 }
 
+// sql runs a query against the stack Postgres, skipping the scenario when the
+// backend has no direct database access.
+func (h *harness) sql(query string) string {
+	h.t.Helper()
+	out, ok := h.b.sql(query)
+	if !ok {
+		h.t.Skipf("backend %s has no direct database access; sql scenarios are compose-only", backendName())
+	}
+	return out
+}
+
 // setEnv changes an abstract knob (e.g. failpoint arming); effective at the
 // next restart of the component it affects.
 func (h *harness) setEnv(key, value string) {

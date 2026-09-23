@@ -58,19 +58,18 @@ func randomToken(t *testing.T) string {
 // with connection URLs routed through that component's toxiproxy listeners.
 func (c *simCredentials) writeSecretFiles(t *testing.T, dir string) {
 	t.Helper()
-	ports := map[string]struct{ pg, redis int }{
-		"apiserver": {25432, 26379},
-		"processor": {35432, 36379},
-		"gc":        {45432, 46379},
+	pgPorts := map[string]int{
+		"apiserver": 25432,
+		"processor": 35432,
+		"gc":        45432,
 	}
-	for component, p := range ports {
+	for component, pgPort := range pgPorts {
 		root := filepath.Join(dir, component)
 		if err := os.MkdirAll(root, 0o755); err != nil {
 			t.Fatalf("create secrets dir: %v", err)
 		}
 		files := map[string]string{
-			"postgresql-url":       fmt.Sprintf("postgres://sim:%s@toxiproxy:%d/batchgw?sslmode=disable", c.pgPassword, p.pg),
-			"redis-url":            fmt.Sprintf("redis://toxiproxy:%d/0", p.redis),
+			"postgresql-url":       fmt.Sprintf("postgres://sim:%s@toxiproxy:%d/batchgw?sslmode=disable", c.pgPassword, pgPort),
 			"s3-secret-access-key": c.s3SecretKey,
 		}
 		for name, content := range files {

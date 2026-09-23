@@ -164,6 +164,22 @@ func (c *apiClient) cancelBatch(id string) (openai.Batch, error) {
 	return decodeInto[openai.Batch](resp)
 }
 
+func (c *apiClient) fileContent(id string) (string, error) {
+	resp, err := c.do(http.MethodGet, "/v1/files/"+id+"/content", "", nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read file %s content: %w", id, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("file %s content: HTTP %d: %s", id, resp.StatusCode, body)
+	}
+	return string(body), nil
+}
+
 func (c *apiClient) listFiles() ([]openai.FileObject, error) {
 	resp, err := c.do(http.MethodGet, "/v1/files", "", nil)
 	if err != nil {

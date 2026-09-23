@@ -1,4 +1,4 @@
-# Simulation harness apiserver config: real Postgres records, Redis exchange,
+# Simulation harness apiserver config: real Postgres records and exchange,
 # MinIO object storage. See docs/design/consistency-harness.md.
 host: ""
 port: "8000"
@@ -35,5 +35,4 @@ file_api:
   max_line_count: 50000
 
 otel:
-  redis_tracing: true
   postgresql_tracing: true

@@ -59,8 +59,8 @@ two host processes instead of a container; everything else is identical.
 ## Prerequisites
 
 - Docker (or a `docker`-compatible CLI) with compose v2
-- The vllm-vcr image. Build it from the vllm-vcr repo:
-  `podman build -t ghcr.io/neuralmagic/vllm-vcr:dev .` or set `VCR_IMAGE`.
+- The vllm-vcr image, by default `ghcr.io/neuralmagic/vllm-vcr:0.2.2-vllm0.27`
+  (the `make dev-deploy` pin). Set `VCR_IMAGE` to test another build.
   First startup downloads the model tokenizer from Hugging Face into the
   `hf-cache` volume.
 

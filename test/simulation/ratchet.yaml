@@ -20,3 +20,9 @@ scenarios:
   cancel_racing_completion: fixed
   zombie_owner_burns_inference: broken
   replicas_execute_once: fixed
+  dispatcher_crash_redelivers: fixed
+  zombie_dispatcher_fenced: fixed
+  postgres_restart_mid_batch: fixed
+  dispatcher_pg_reply_loss: fixed
+  processor_pg_reply_loss: fixed
+  dispatcher_engine_resets: fixed

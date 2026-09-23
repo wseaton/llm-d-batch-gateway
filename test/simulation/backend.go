@@ -62,6 +62,9 @@ type stackBackend interface {
 	// a network partition; unpause resumes it.
 	pause(service string)
 	unpause(service string)
+	// sql runs a query against the stack Postgres and returns its unaligned
+	// output, ok=false when the backend cannot reach the database directly.
+	sql(query string) (out string, ok bool)
 }
 
 // simParams are backend timing characteristics scenarios must scale to.

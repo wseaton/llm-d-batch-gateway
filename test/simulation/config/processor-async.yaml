@@ -1,5 +1,5 @@
-# Simulation harness processor config for async dispatch (llm-d-async over
-# the stack redis). The harness runs the queue consumer; see asyncbridge.go.
+# Simulation harness processor config for async dispatch through llm-d-async's
+# sql transport, which shares the stack Postgres with the dispatcher services.
 # See docs/design/consistency-harness.md.
 task_wait_time: "500ms"
 poll_interval: "1s"
@@ -23,6 +23,7 @@ work_dir: "/tmp/processor"
 
 dispatch_mode: "async"
 async_dispatch:
+  transport: "sql"
   result_poll_timeout: "2s"
   models:
     "Qwen/Qwen2.5-0.5B-Instruct":
@@ -45,5 +46,4 @@ file_client:
     auto_create_bucket: true
 
 otel:
-  redis_tracing: true
   postgresql_tracing: true
