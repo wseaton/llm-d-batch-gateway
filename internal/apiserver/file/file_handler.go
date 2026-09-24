@@ -633,7 +633,11 @@ func (c *FileAPIHandler) DownloadFile(w http.ResponseWriter, r *http.Request) {
 	defer fileReader.Close()
 
 	// Set response headers for file download
-	w.Header().Set("Content-Type", "application/octet-stream")
+	contentType := fileMeta.ContentType
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fileObj.Filename))
 	if fileMeta.Size > 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(fileMeta.Size, 10))

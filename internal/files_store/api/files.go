@@ -40,6 +40,14 @@ type BatchFileMetadata struct {
 	Size        int64     // The size of the file in bytes.
 	LinesNumber int64     // The size of the file in lines.
 	ModTime     time.Time // Modification time.
+	ContentType string    // Stored media type, when the backend records one.
+}
+
+// ObjectAdopter moves an object that already sits in the files bucket to a file's storage
+// location without its bytes passing through the caller.
+type ObjectAdopter interface {
+	// Adopt moves the object named by sourceRef (s3://bucket/key) to fileName in folderName.
+	Adopt(ctx context.Context, sourceRef, fileName, folderName string) (*BatchFileMetadata, error)
 }
 
 type BatchFilesClient interface {

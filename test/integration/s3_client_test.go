@@ -44,6 +44,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
 	"github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
 	s3client "github.com/llm-d/llm-d-batch-gateway/internal/files_store/s3"
@@ -264,5 +268,71 @@ func TestS3GetContext(t *testing.T) {
 	remaining := time.Until(deadline)
 	if remaining < 4*time.Second || remaining > 6*time.Second {
 		t.Errorf("expected ~5s remaining, got %v", remaining)
+	}
+}
+
+// putRaw writes an object straight into the bucket, standing in for the async dispatcher's
+// result store, and returns its s3:// reference.
+func putRaw(t *testing.T, cfg s3client.Config, key, contentType string, body []byte) string {
+	t.Helper()
+	ctx := context.Background()
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cfg.Region),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
+		o.BaseEndpoint = aws.String(cfg.Endpoint)
+		o.UsePathStyle = true
+	})
+	if _, err := raw.PutObject(ctx, &awss3.PutObjectInput{
+		Bucket: aws.String(cfg.Bucket), Key: aws.String(key), Body: bytes.NewReader(body), ContentType: aws.String(contentType),
+	}); err != nil {
+		t.Fatalf("put %s: %v", key, err)
+	}
+	return "s3://" + cfg.Bucket + "/" + key
+}
+
+func TestS3AdoptMovesTheObjectAndKeepsItsType(t *testing.T) {
+	cfg := s3Config()
+	client := newS3IntegrationClient(t, cfg)
+	ctx := context.Background()
+	audio := bytes.Repeat([]byte{0xff, 0xfb, 0x90, 0x00}, 30_000)
+	ref := putRaw(t, cfg, "llm-d-async/results/"+uuid.NewString()+"/gen-a", "audio/mpeg", audio)
+	fileName := "file_" + uuid.NewString() + "_line-1.mp3"
+
+	meta, err := client.Adopt(ctx, ref, fileName, integrationFolderName)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Delete(ctx, fileName, integrationFolderName) })
+	if meta.Location == "" {
+		t.Error("Adopt returned no location")
+	}
+
+	reader, got, err := client.Retrieve(ctx, fileName, integrationFolderName)
+	if err != nil {
+		t.Fatalf("Retrieve adopted file: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	body, _ := io.ReadAll(reader)
+	if !bytes.Equal(body, audio) {
+		t.Errorf("adopted body differs: %d bytes, want %d", len(body), len(audio))
+	}
+	if got.ContentType != "audio/mpeg" {
+		t.Errorf("content type = %q, want audio/mpeg", got.ContentType)
+	}
+
+	if _, err := client.Adopt(ctx, ref, "file_"+uuid.NewString()+".mp3", integrationFolderName); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("adopting the moved source again = %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestS3AdoptRefusesObjectsOutsideTheBucket(t *testing.T) {
+	client := newS3IntegrationClient(t, s3Config())
+	for _, ref := range []string{"s3://another-bucket/llm-d-async/results/x", "http://bucket/key", "s3://" + integrationBucket, "s3://" + integrationBucket + "/"} {
+		if _, err := client.Adopt(context.Background(), ref, "file_x.mp3", integrationFolderName); err == nil {
+			t.Errorf("Adopt(%q) succeeded, want refusal", ref)
+		}
 	}
 }

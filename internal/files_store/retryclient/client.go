@@ -19,6 +19,7 @@ package retryclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -35,7 +36,10 @@ type Client struct {
 	component ucom.Component
 }
 
-var _ api.BatchFilesClient = (*Client)(nil)
+var (
+	_ api.BatchFilesClient = (*Client)(nil)
+	_ api.ObjectAdopter    = (*Client)(nil)
+)
 
 // New creates a retry-wrapping Client.
 // component identifies the caller (e.g. "processor", "apiserver", "garbage-collector") for metrics.
@@ -132,6 +136,34 @@ func (c *Client) Delete(ctx context.Context, fileName, folderName string) error 
 		recordSuccess("delete", c.component)
 	}
 	return err
+}
+
+// Adopt retries the inner client's Adopt; it returns errors.ErrUnsupported when the inner
+// backend cannot adopt objects.
+func (c *Client) Adopt(ctx context.Context, sourceRef, fileName, folderName string) (*api.BatchFileMetadata, error) {
+	adopter, ok := c.inner.(api.ObjectAdopter)
+	if !ok {
+		return nil, errors.ErrUnsupported
+	}
+	var meta *api.BatchFileMetadata
+	attempts, err := retry.Do(ctx, &c.cfg, func(attempt int) error {
+		if attempt > 1 {
+			recordRetry("adopt", c.component)
+			logr.FromContextOrDiscard(ctx).Info("Retrying object adoption",
+				"source", sourceRef, "attempt", attempt, "maxRetries", c.cfg.MaxRetries)
+		}
+		var aerr error
+		meta, aerr = adopter.Adopt(ctx, sourceRef, fileName, folderName)
+		return aerr
+	})
+	if err != nil {
+		if attempts > c.cfg.MaxRetries {
+			recordExhausted("adopt", c.component)
+		}
+		return nil, err
+	}
+	recordSuccess("adopt", c.component)
+	return meta, nil
 }
 
 func (c *Client) Close() error {
