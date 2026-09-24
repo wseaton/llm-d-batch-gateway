@@ -118,17 +118,7 @@ func newEventPool(ctx context.Context, config *PostgreSQLConfig) (*pgxpool.Pool,
 		return nil, fmt.Errorf("postgresql config cannot be nil")
 	}
 
-	pool, err := newPool(ctx, config)
-	if err != nil {
-		return nil, err
-	}
-
-	if _, err := pool.Exec(ctx, batchSchemaSql); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("failed to apply batch events schema: %w", err)
-	}
-
-	return pool, nil
+	return newPool(ctx, config)
 }
 
 func (c *PostgresBatchEventClient) Close() error {

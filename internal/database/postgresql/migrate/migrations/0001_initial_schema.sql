@@ -57,14 +57,17 @@ CREATE INDEX IF NOT EXISTS idx_batch_items_processor
     ON batch_items (processor_id)
     WHERE processor_id IS NOT NULL;
 
--- Durable-until-consumed events (BatchEventChannelClient).
--- id BIGSERIAL gives FIFO ordering. event_type = int(BatchEventType). expires_at = unix seconds.
--- Rows are the source of truth (durable, late-attach-safe); NOTIFY is a latency hint.
-CREATE TABLE IF NOT EXISTS batch_events (
-    id         BIGSERIAL PRIMARY KEY,
-    job_id     TEXT      NOT NULL,
-    event_type INTEGER   NOT NULL,
-    expires_at BIGINT    NOT NULL
+CREATE TABLE IF NOT EXISTS file_items (
+    id         TEXT PRIMARY KEY,
+    tenant_id  TEXT NOT NULL,
+    expiry     BIGINT,
+    tags       JSONB,
+    purpose    TEXT,
+    spec       JSONB,
+    status     JSONB
 );
-CREATE INDEX IF NOT EXISTS idx_batch_events_job_id ON batch_events (job_id, id);
-CREATE INDEX IF NOT EXISTS idx_batch_events_expires_at ON batch_events (expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_file_items_tenant_id ON file_items(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_file_items_expiry ON file_items(expiry) WHERE expiry IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_file_items_purpose ON file_items(purpose) WHERE purpose IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_file_items_tags ON file_items USING GIN (tags) WHERE tags IS NOT NULL;

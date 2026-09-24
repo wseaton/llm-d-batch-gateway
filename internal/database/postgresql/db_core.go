@@ -23,16 +23,14 @@ package postgresql
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/llm-d/llm-d-batch-gateway/internal/database/api"
+	"github.com/llm-d/llm-d-batch-gateway/internal/database/postgresql/migrate"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/logging"
 )
 
@@ -53,9 +51,6 @@ const (
 type TableDescriptor interface {
 	// TableName returns the PostgreSQL table name.
 	TableName() string
-	// Schema returns the DDL SQL to create the table and indexes.
-	// Must be idempotent (use IF NOT EXISTS).
-	Schema() string
 	// ExtraColumns returns names of additional indexed columns
 	// beyond the common set (id, tenant_id, expiry, tags).
 	ExtraColumns() []string
@@ -79,7 +74,7 @@ func newPgCore(ctx context.Context, config *PostgreSQLConfig, tableDescriptor Ta
 		desc: tableDescriptor,
 	}
 
-	if err := pgCore.ensureSchema(ctx); err != nil {
+	if err := migrate.Check(ctx, pool); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -470,26 +465,6 @@ func (c *pgCore) delete(ctx context.Context, ids []string) (deletedIDs []string,
 		"nDeleted", len(deletedIDs), "ids", deletedIDs)
 
 	return deletedIDs, nil
-}
-
-// ensureSchema applies the table DDL.
-func (c *pgCore) ensureSchema(ctx context.Context) error {
-	var err error
-	for attempt := 0; attempt < 3; attempt++ {
-		if _, err = c.pool.Exec(ctx, c.desc.Schema()); err == nil {
-			return nil
-		}
-		var pgErr *pgconn.PgError
-		if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
-		}
-	}
-	return err
 }
 
 func (c *pgCore) close() error {
