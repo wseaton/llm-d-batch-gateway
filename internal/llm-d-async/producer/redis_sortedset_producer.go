@@ -320,6 +320,47 @@ func (p *RedisSortedSetProducer) GetResult(ctx context.Context) (*api.ResultMess
 	}
 }
 
+// GetResults waits for one result like GetResult, then takes up to limit-1 more that are
+// already queued. A malformed result and everything queued behind it go back to the list,
+// so the next read reports it the way GetResult does.
+func (p *RedisSortedSetProducer) GetResults(ctx context.Context, limit int) ([]*api.ResultMessage, error) {
+	if limit <= 0 {
+		return nil, errors.New("limit must be positive")
+	}
+	first, err := p.GetResult(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := []*api.ResultMessage{first}
+	if limit == 1 {
+		return out, nil
+	}
+	rest, err := p.client.RPopCount(ctx, p.resultQueueName, limit-1).Result()
+	if err != nil {
+		return out, nil
+	}
+	for i, data := range rest {
+		res, perr := p.parseResult(data)
+		if perr != nil {
+			if err := p.requeue(ctx, rest[i:]); err != nil {
+				return out, fmt.Errorf("failed to requeue results after a malformed one: %w", err)
+			}
+			return out, nil
+		}
+		out = append(out, res)
+	}
+	return out, nil
+}
+
+// requeue puts popped results back on the consuming end of the list in their original order.
+func (p *RedisSortedSetProducer) requeue(ctx context.Context, popped []string) error {
+	values := make([]any, len(popped))
+	for i, v := range popped {
+		values[len(popped)-1-i] = v
+	}
+	return p.client.RPush(ctx, p.resultQueueName, values...).Err()
+}
+
 // parseResult parses a JSON result message.
 func (p *RedisSortedSetProducer) parseResult(data string) (*api.ResultMessage, error) {
 	return parseInternalResult(data)

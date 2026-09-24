@@ -49,8 +49,8 @@ type batchSubmitter interface {
 // can read several per round trip.
 const resultReadBatch = 256
 
-// batchReader reads up to limit results in one round trip. The sql producer
-// does; the redis producers read one at a time.
+// batchReader reads up to limit results per call. The sql and redis-sortedset
+// producers do.
 type batchReader interface {
 	GetResults(ctx context.Context, limit int) ([]*asyncapi.ResultMessage, error)
 }

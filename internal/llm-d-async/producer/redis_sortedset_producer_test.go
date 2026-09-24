@@ -294,6 +294,100 @@ func TestGetResult(t *testing.T) {
 	assert.Contains(t, result.Payload, "Hello!")
 }
 
+func pushResults(t *testing.T, mr *miniredis.Miniredis, values ...string) {
+	t.Helper()
+	for _, v := range values {
+		_, err := mr.Lpush("test-result-queue", v)
+		require.NoError(t, err)
+	}
+}
+
+func resultJSON(t *testing.T, id string) string {
+	t.Helper()
+	b, err := json.Marshal(api.ResultMessage{ID: id, Payload: `{"n":"` + id + `"}`})
+	require.NoError(t, err)
+	return string(b)
+}
+
+func resultIDs(results []*api.ResultMessage) []string {
+	ids := make([]string, len(results))
+	for i, r := range results {
+		ids[i] = r.ID
+	}
+	return ids
+}
+
+func TestGetResultsReadsInArrivalOrderUpToLimit(t *testing.T) {
+	producer, mr := setupTestProducer(t)
+	pushResults(t, mr, resultJSON(t, "r1"), resultJSON(t, "r2"), resultJSON(t, "r3"), resultJSON(t, "r4"), resultJSON(t, "r5"))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	got, err := producer.GetResults(ctx, 3)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"r1", "r2", "r3"}, resultIDs(got))
+	assert.Equal(t, `{"n":"r1"}`, got[0].Payload)
+
+	got, err = producer.GetResults(ctx, 256)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"r4", "r5"}, resultIDs(got))
+
+	depth, err := producer.ResultQueueDepth(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, depth)
+}
+
+func TestGetResultsLimitOneReadsOne(t *testing.T) {
+	producer, mr := setupTestProducer(t)
+	pushResults(t, mr, resultJSON(t, "r1"), resultJSON(t, "r2"))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	got, err := producer.GetResults(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"r1"}, resultIDs(got))
+	depth, err := producer.ResultQueueDepth(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, depth)
+}
+
+func TestGetResultsRequeuesFromAMalformedResult(t *testing.T) {
+	producer, mr := setupTestProducer(t)
+	pushResults(t, mr, resultJSON(t, "r1"), resultJSON(t, "r2"), "invalid-json{{{", resultJSON(t, "r3"))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	got, err := producer.GetResults(ctx, 256)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"r1", "r2"}, resultIDs(got))
+
+	_, err = producer.GetResults(ctx, 256)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unmarshal")
+
+	got, err = producer.GetResults(ctx, 256)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"r3"}, resultIDs(got))
+}
+
+func TestGetResultsRejectsNonPositiveLimit(t *testing.T) {
+	producer, _ := setupTestProducer(t)
+	for _, limit := range []int{0, -1} {
+		_, err := producer.GetResults(context.Background(), limit)
+		assert.Error(t, err)
+	}
+}
+
+func TestGetResultsReturnsWhenContextEndsOnEmptyQueue(t *testing.T) {
+	producer, _ := setupTestProducer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	got, err := producer.GetResults(ctx, 256)
+	require.Error(t, err)
+	assert.Nil(t, got)
+}
+
 func TestGetResultWithContextTimeout(t *testing.T) {
 	producer, mr := setupTestProducer(t)
 
