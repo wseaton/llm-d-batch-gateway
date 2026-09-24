@@ -48,14 +48,11 @@ data:
       transport: {{ .Values.processor.config.asyncDispatch.transport | quote }}
       {{- end }}
       result_poll_timeout: {{ .Values.processor.config.asyncDispatch.resultPollTimeout | quote }}
-      {{- if .Values.processor.config.asyncDispatch.sql }}
-      sql:
-        {{- if .Values.processor.config.asyncDispatch.sql.submitBatchSize }}
-        submit_batch_size: {{ .Values.processor.config.asyncDispatch.sql.submitBatchSize }}
-        {{- end }}
-        {{- if .Values.processor.config.asyncDispatch.sql.submitLinger }}
-        submit_linger: {{ .Values.processor.config.asyncDispatch.sql.submitLinger | quote }}
-        {{- end }}
+      {{- if .Values.processor.config.asyncDispatch.submitBatchSize }}
+      submit_batch_size: {{ .Values.processor.config.asyncDispatch.submitBatchSize }}
+      {{- end }}
+      {{- if .Values.processor.config.asyncDispatch.submitLinger }}
+      submit_linger: {{ .Values.processor.config.asyncDispatch.submitLinger | quote }}
       {{- end }}
       {{- if .Values.processor.config.asyncDispatch.models }}
       models:

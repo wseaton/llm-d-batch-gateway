@@ -348,9 +348,8 @@ processor:
       # batch database).
       transport: ""
       resultPollTimeout: "30s"
-      # sql transport only: submitBatchSize (requests enqueued per statement,
-      # default 256) and submitLinger (how long a partial batch waits, default 25ms).
-      sql: {}
+      # submitBatchSize: requests enqueued per call (default 256).
+      # submitLinger: how long a partial batch waits for more (default 25ms).
       models: {}
 
     # Sync mode: configure exactly one of globalInferenceGateway or modelGateways.

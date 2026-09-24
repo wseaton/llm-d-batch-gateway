@@ -160,15 +160,6 @@ type AsyncDispatchConfig struct {
 	// Required when DispatchMode == "async".
 	Models map[string]AsyncModelConfig `yaml:"models"`
 
-	// SQL holds settings that apply only to the sql transport.
-	SQL SQLDispatchConfig `yaml:"sql"`
-}
-
-// SQLDispatchConfig tunes the sql transport's enqueue path. Only the sql
-// producer enqueues a batch in one statement, so batching these settings
-// describe is meaningless — and its linger actively harmful — on a transport
-// that submits one request at a time.
-type SQLDispatchConfig struct {
 	// SubmitBatchSize bounds how many requests are enqueued in one call.
 	// Zero uses the default.
 	SubmitBatchSize int `yaml:"submit_batch_size"`
@@ -429,10 +420,8 @@ func NewConfig() *ProcessorConfig {
 		DispatchMode: DispatchModeSync,
 		AsyncDispatchConfig: AsyncDispatchConfig{
 			ResultPollTimeout: 5 * time.Second,
-			SQL: SQLDispatchConfig{
-				SubmitBatchSize: 256,
-				SubmitLinger:    25 * time.Millisecond,
-			},
+			SubmitBatchSize:   256,
+			SubmitLinger:      25 * time.Millisecond,
 		},
 	}
 }
@@ -573,11 +562,11 @@ func (c *ProcessorConfig) validateAsyncDispatchConfig() error {
 	if c.AsyncDispatchConfig.ResultPollTimeout <= 0 {
 		return fmt.Errorf("async_dispatch.result_poll_timeout must be > 0")
 	}
-	if c.AsyncDispatchConfig.SQL.SubmitBatchSize < 0 {
-		return fmt.Errorf("async_dispatch.sql.submit_batch_size must not be negative")
+	if c.AsyncDispatchConfig.SubmitBatchSize < 0 {
+		return fmt.Errorf("async_dispatch.submit_batch_size must not be negative")
 	}
-	if c.AsyncDispatchConfig.SQL.SubmitLinger < 0 {
-		return fmt.Errorf("async_dispatch.sql.submit_linger must not be negative")
+	if c.AsyncDispatchConfig.SubmitLinger < 0 {
+		return fmt.Errorf("async_dispatch.submit_linger must not be negative")
 	}
 	switch c.AsyncDispatchConfig.Transport {
 	case "", inference.AsyncTransportRedisSortedSet, inference.AsyncTransportSQL:
