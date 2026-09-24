@@ -15,7 +15,7 @@ scenarios:
   cancel_event_lost: broken
   orphaned_blob: broken
   finalization_strand: broken
-  async_result_destruction: broken
+  async_result_destruction: fixed
   recovery_crash_loop: fixed
   cancel_racing_completion: fixed
   zombie_owner_burns_inference: broken
@@ -25,4 +25,4 @@ scenarios:
   postgres_restart_mid_batch: fixed
   dispatcher_pg_reply_loss: fixed
   processor_pg_reply_loss: fixed
-  dispatcher_engine_resets: fixed
+  dispatcher_engine_resets: broken

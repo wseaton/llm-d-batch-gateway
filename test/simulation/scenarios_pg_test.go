@@ -39,10 +39,10 @@ func asyncHarness(t *testing.T) *harness {
 	t.Helper()
 	h := newHarness(t, map[string]string{"PROCESSOR_CONFIG": "processor-async.yaml"})
 	h.waitForSchema()
-	h.sql(`CREATE TABLE IF NOT EXISTS sim_result_inserts (id TEXT NOT NULL, request_token TEXT NOT NULL)`)
+	h.sql(`CREATE TABLE IF NOT EXISTS sim_result_inserts (id TEXT NOT NULL, request_token TEXT NOT NULL, payload TEXT NOT NULL)`)
 	h.sql(`CREATE OR REPLACE FUNCTION sim_result_insert() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-	INSERT INTO sim_result_inserts (id, request_token) VALUES (NEW.id, NEW.request_token);
+	INSERT INTO sim_result_inserts (id, request_token, payload) VALUES (NEW.id, NEW.request_token, NEW.payload);
 	RETURN NEW;
 END $$`)
 	h.sql(`DROP TRIGGER IF EXISTS sim_result_insert ON async_results`)
@@ -100,7 +100,8 @@ type outcome struct {
 }
 
 // violations lists every end-state invariant the batch broke: it must
-// complete with each request answered exactly once, the engine must have run
+// complete with each request answered exactly once and none failed, since the
+// injected faults are transient, the engine must have run
 // every request and no more than extraBound again, and the async tables must
 // drain with at most one result committed per request generation.
 func (o outcome) violations() []string {
@@ -111,6 +112,9 @@ func (o outcome) violations() []string {
 	c := o.final.RequestCounts
 	if c.Total != int64(o.lines) || c.Completed+c.Failed != c.Total {
 		v = append(v, fmt.Sprintf("counts total=%d completed=%d failed=%d for %d lines", c.Total, c.Completed, c.Failed, o.lines))
+	}
+	if c.Failed > 0 {
+		v = append(v, fmt.Sprintf("%d requests failed on faults that healed", c.Failed))
 	}
 	if len(o.missing) > 0 {
 		v = append(v, fmt.Sprintf("no record for %v", o.missing))

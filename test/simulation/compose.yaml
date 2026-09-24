@@ -30,6 +30,7 @@ x-dispatcher: &dispatcher
       condition: service_healthy
 
 x-processor: &processor
+  image: bgw-sim-processor:local
   build:
     context: ../..
     dockerfile: docker/Dockerfile.processor

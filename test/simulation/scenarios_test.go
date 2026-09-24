@@ -307,6 +307,9 @@ func TestCancelEventLost(t *testing.T) {
 // bucket older than the grace period has a file record.
 func TestOrphanedBlob(t *testing.T) {
 	const scenario = "orphaned_blob"
+	if backendName() != "kind" {
+		t.Skip("needs the orphan reconciler, which needs a cluster; run on the kind backend")
+	}
 	h := newHarness(t, map[string]string{
 		"PROCESSOR_FAILPOINTS": "processor/after-blob-store=exit",
 	})
@@ -355,6 +358,9 @@ func TestOrphanedBlob(t *testing.T) {
 // linked from the batch that produced them.
 func TestFinalizationStrand(t *testing.T) {
 	const scenario = "finalization_strand"
+	if backendName() != "kind" {
+		t.Skip("needs the orphan reconciler, which needs a cluster; run on the kind backend")
+	}
 	// The second failpoint keeps the replacement container from completing
 	// the job via startup recovery (on Kubernetes an exit only restarts the
 	// container and emptyDir survives), modeling pod replacement / crash
