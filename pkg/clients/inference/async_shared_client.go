@@ -3,6 +3,7 @@ package inference
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -143,12 +144,20 @@ func (c *asyncSharedClient) SubmitBatch(ctx context.Context, reqs []*GenerateReq
 }
 
 func (c *asyncSharedClient) GetResult(ctx context.Context) (*GenerateResponse, error) {
-	pollCtx, pollCancel := context.WithTimeout(ctx, c.pollTimeout)
-	defer pollCancel()
-
-	result, err := c.producer.GetResult(pollCtx)
-	if err != nil {
-		return nil, err
+	var result *asyncapi.ResultMessage
+	for {
+		pollCtx, pollCancel := context.WithTimeout(ctx, c.pollTimeout)
+		var err error
+		result, err = c.producer.GetResult(pollCtx)
+		empty := err != nil && ctx.Err() == nil && errors.Is(pollCtx.Err(), context.DeadlineExceeded)
+		pollCancel()
+		if empty {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		break
 	}
 
 	return &GenerateResponse{

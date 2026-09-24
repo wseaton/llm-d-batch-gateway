@@ -18,10 +18,12 @@ package inference
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"testing"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	producersql "github.com/llm-d/llm-d-async/producer-sql"
 )
 
@@ -100,5 +102,60 @@ func TestNewAsyncResolver_UnknownTransport(t *testing.T) {
 	}, testLogger(t))
 	if err == nil {
 		t.Fatal("expected an error for an unknown transport")
+	}
+}
+
+// GetResult waits through poll windows that end without a result instead of
+// reporting them as errors, which the result broadcaster backs off on.
+func TestAsyncSharedClient_GetResultWaitsPastEmptyPolls(t *testing.T) {
+	dsn := os.Getenv("TEST_POSTGRES_URL")
+	if dsn == "" {
+		t.Skip("TEST_POSTGRES_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	const route = "empty-poll-results"
+	p, err := producersql.New(ctx, producersql.Config{URL: dsn, RequestQueueName: "empty-poll-requests", ResultQueueName: route})
+	if err != nil {
+		t.Fatalf("producersql.New: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.ExecContext(ctx, `DELETE FROM async_results WHERE route = $1`, route); err != nil {
+		t.Fatalf("clear results: %v", err)
+	}
+
+	client := newAsyncSharedClient(p, 200*time.Millisecond, testLogger(t))
+	type got struct {
+		resp *GenerateResponse
+		err  error
+	}
+	done := make(chan got, 1)
+	start := time.Now()
+	go func() {
+		resp, err := client.GetResult(ctx)
+		done <- got{resp, err}
+	}()
+
+	time.Sleep(700 * time.Millisecond)
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO async_results (route, id, request_token, payload, expires_at, created_at) VALUES ($1, 'late-1', 'token-1', '{"id":"late-1","payload":"ok","status_code":200}', 0, 0)`,
+		route); err != nil {
+		t.Fatalf("insert result: %v", err)
+	}
+
+	r := <-done
+	if r.err != nil {
+		t.Fatalf("GetResult after empty polls: %v", r.err)
+	}
+	if r.resp.RequestID != "late-1" || string(r.resp.Response) != "ok" {
+		t.Fatalf("GetResult = %+v, want late-1 with payload ok", r.resp)
+	}
+	if elapsed := time.Since(start); elapsed < 700*time.Millisecond {
+		t.Fatalf("GetResult returned after %v, before the result existed", elapsed)
 	}
 }
