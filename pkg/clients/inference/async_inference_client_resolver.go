@@ -127,6 +127,21 @@ func (r *AsyncGatewayResolver) Close() error {
 	return errors.Join(errs...)
 }
 
+// modelQueues returns a model's request and result queue names.
+func modelQueues(mcfg AsyncModelPoolConfig) (string, string) {
+	reqQueue := mcfg.RequestQueueName
+	resQueue := mcfg.ResultQueueName
+	// Deprecated: derived queue names from pool name. Set explicit
+	// request_queue_name / result_queue_name in async model config.
+	if reqQueue == "" {
+		reqQueue = asyncQueuePrefix + "requests:" + mcfg.PoolName
+	}
+	if resQueue == "" {
+		resQueue = asyncQueuePrefix + "results:" + mcfg.PoolName
+	}
+	return reqQueue, resQueue
+}
+
 // NewAsyncResolver creates an AsyncGatewayResolver with one shared pool
 // (producer) per model/pool pair.
 func NewAsyncResolver(config AsyncClientConfig, logger logr.Logger) (*AsyncGatewayResolver, error) {
@@ -135,11 +150,17 @@ func NewAsyncResolver(config AsyncClientConfig, logger logr.Logger) (*AsyncGatew
 	}
 
 	poolToModel := make(map[string]string, len(config.Models))
+	resultQueueToModel := make(map[string]string, len(config.Models))
 	for model, mcfg := range config.Models {
 		if existing, ok := poolToModel[mcfg.PoolName]; ok {
 			return nil, fmt.Errorf("models %q and %q both map to pool %q: each pool must have a single consumer", existing, model, mcfg.PoolName)
 		}
 		poolToModel[mcfg.PoolName] = model
+		_, resQueue := modelQueues(mcfg)
+		if existing, ok := resultQueueToModel[resQueue]; ok {
+			return nil, fmt.Errorf("models %q and %q both read result queue %q: each result queue must have a single consumer, or one model's reader discards the other's results", existing, model, resQueue)
+		}
+		resultQueueToModel[resQueue] = model
 	}
 
 	if config.ResultPollTimeout <= 0 {
@@ -155,16 +176,7 @@ func NewAsyncResolver(config AsyncClientConfig, logger logr.Logger) (*AsyncGatew
 	var closers []io.Closer
 
 	for model, mcfg := range config.Models {
-		reqQueue := mcfg.RequestQueueName
-		resQueue := mcfg.ResultQueueName
-		// Deprecated: derived queue names from pool name. Set explicit
-		// request_queue_name / result_queue_name in async model config.
-		if reqQueue == "" {
-			reqQueue = asyncQueuePrefix + "requests:" + mcfg.PoolName
-		}
-		if resQueue == "" {
-			resQueue = asyncQueuePrefix + "results:" + mcfg.PoolName
-		}
+		reqQueue, resQueue := modelQueues(mcfg)
 		// Each Processor consumes from its own result queue so another healthy
 		// replica cannot consume and discard its results.
 		resQueue = resQueue + ":" + config.ConsumerID

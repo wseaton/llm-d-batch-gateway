@@ -19,6 +19,7 @@ package inference
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,6 +94,58 @@ func TestNewAsyncResolver(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error for duplicate pool mapping")
 		}
+	})
+
+	t.Run("rejects models sharing a result queue", func(t *testing.T) {
+		mr := miniredis.RunT(t)
+
+		_, err := NewAsyncResolver(AsyncClientConfig{
+			RedisURL:   "redis://" + mr.Addr(),
+			ConsumerID: testAsyncConsumerID,
+			Models: map[string]AsyncModelPoolConfig{
+				"chat": {PoolName: "chat-pool", RequestQueueName: "llm-d-async:requests:chat", ResultQueueName: "llm-d-async:results:shared"},
+				"tts":  {PoolName: "tts-pool", RequestQueueName: "llm-d-async:requests:tts", ResultQueueName: "llm-d-async:results:shared"},
+			},
+			ResultPollTimeout: time.Second,
+		}, testLogger(t))
+		if err == nil || !strings.Contains(err.Error(), "llm-d-async:results:shared") {
+			t.Fatalf("err = %v, want a shared result queue error", err)
+		}
+	})
+
+	t.Run("rejects an explicit result queue that equals another model's derived one", func(t *testing.T) {
+		mr := miniredis.RunT(t)
+
+		_, err := NewAsyncResolver(AsyncClientConfig{
+			RedisURL:   "redis://" + mr.Addr(),
+			ConsumerID: testAsyncConsumerID,
+			Models: map[string]AsyncModelPoolConfig{
+				"chat": {PoolName: "chat-pool"},
+				"tts":  {PoolName: "tts-pool", RequestQueueName: "llm-d-async:requests:tts", ResultQueueName: "llm-d-async:results:chat-pool"},
+			},
+			ResultPollTimeout: time.Second,
+		}, testLogger(t))
+		if err == nil || !strings.Contains(err.Error(), "llm-d-async:results:chat-pool") {
+			t.Fatalf("err = %v, want a shared result queue error", err)
+		}
+	})
+
+	t.Run("accepts models with their own result queues", func(t *testing.T) {
+		mr := miniredis.RunT(t)
+
+		r, err := NewAsyncResolver(AsyncClientConfig{
+			RedisURL:   "redis://" + mr.Addr(),
+			ConsumerID: testAsyncConsumerID,
+			Models: map[string]AsyncModelPoolConfig{
+				"chat": {PoolName: "chat-pool", RequestQueueName: "llm-d-async:requests:chat", ResultQueueName: "llm-d-async:results:chat"},
+				"tts":  {PoolName: "tts-pool", RequestQueueName: "llm-d-async:requests:tts", ResultQueueName: "llm-d-async:results:tts"},
+			},
+			ResultPollTimeout: time.Second,
+		}, testLogger(t))
+		if err != nil {
+			t.Fatalf("NewAsyncResolver: %v", err)
+		}
+		_ = r.Close()
 	})
 
 	t.Run("invalid Redis URL returns error", func(t *testing.T) {
