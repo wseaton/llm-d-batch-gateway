@@ -348,6 +348,8 @@ processor:
       # batch database).
       transport: ""
       resultPollTimeout: "30s"
+      # resultStorePrefix: the dispatcher's --result-store-s3-prefix. Response bodies it stores
+      # by reference (audio) are adopted as batch_output files; requires the s3 files store.
       # submitBatchSize: requests enqueued per call (default 256).
       # submitLinger: how long a partial batch waits for more (default 25ms).
       models: {}

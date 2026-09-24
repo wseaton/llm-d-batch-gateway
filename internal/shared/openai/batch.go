@@ -35,6 +35,7 @@ const (
 	EndpointEmbeddings      Endpoint = "/v1/embeddings"
 	EndpointCompletions     Endpoint = "/v1/completions"
 	EndpointModerations     Endpoint = "/v1/moderations"
+	EndpointAudioSpeech     Endpoint = "/v1/audio/speech"
 )
 
 func (e Endpoint) String() string {
@@ -49,7 +50,8 @@ func IsValidEndpoint(endpoint string) bool {
 		EndpointChatCompletions,
 		EndpointEmbeddings,
 		EndpointCompletions,
-		EndpointModerations:
+		EndpointModerations,
+		EndpointAudioSpeech:
 		return true
 	default:
 		return false

@@ -11,10 +11,12 @@ import (
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 
 	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
+	filesapi "github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/batchctx"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/config"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/pipeline"
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
+	ucom "github.com/llm-d/llm-d-batch-gateway/internal/util/com"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/logging"
 )
 
@@ -133,6 +135,12 @@ func (p *Processor) executeJobAsync(ctx context.Context, params *jobExecutionPar
 		tracker,
 		logger,
 	)
+
+	if adopter, err := p.jobPayloadAdopter(params); err != nil {
+		return nil, err
+	} else if adopter != nil {
+		resultCollector.SetPayloadAdopter(adopter)
+	}
 
 	// Orchestrates Job execution.
 	executor := pipeline.NewJobExecutor(pipeline.JobExecutorConfig{
@@ -275,4 +283,32 @@ func buildAIMDModels(modelMap *modelMapFile, resolver *inference.GatewayResolver
 		}
 	}
 	return models
+}
+
+// jobPayloadAdopter returns the adopter for async results stored by reference, or nil when the
+// processor does not dispatch async or its files store cannot adopt objects.
+func (p *Processor) jobPayloadAdopter(params *jobExecutionParams) (*jobPayloadAdopter, error) {
+	if p.asyncInference == nil {
+		return nil, nil
+	}
+	files, ok := p.files.storage.(filesapi.ObjectAdopter)
+	if !ok {
+		return nil, nil
+	}
+	folder, err := ucom.GetFolderNameByTenantID(params.jobInfo.TenantID)
+	if err != nil {
+		return nil, fmt.Errorf("folder for tenant %s: %w", params.jobInfo.TenantID, err)
+	}
+	var tags db.Tags
+	if params.jobItem != nil {
+		tags = params.jobItem.Tags
+	}
+	return &jobPayloadAdopter{
+		p:         p,
+		files:     files,
+		tenantID:  params.jobInfo.TenantID,
+		folder:    folder,
+		batchTags: tags,
+		keyPrefix: p.cfg.AsyncDispatchConfig.ResultStorePrefix,
+	}, nil
 }

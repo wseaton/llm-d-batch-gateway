@@ -84,18 +84,25 @@ var (
 // ResultMessage is the async inference result returned to callers.
 //
 // Wire-format semantics:
-//   - StatusCode > 0: an HTTP response was received. Payload contains the response body.
+//   - StatusCode > 0: an HTTP response was received. Payload contains the response body, or,
+//     when PayloadRef is set, Payload is empty and the body is the object PayloadRef names.
 //   - StatusCode == 0: no HTTP response. ErrorCode/ErrorMessage describe the failure.
 //
 // Routing and Metadata are infrastructure pass-through (json:"-").
 type ResultMessage struct {
-	ID           string            `json:"id"`
-	StatusCode   int               `json:"status_code,omitempty"`
-	Payload      string            `json:"payload"`
-	ErrorCode    string            `json:"error_code,omitempty"`
-	ErrorMessage string            `json:"error_message,omitempty"`
-	Routing      InternalRouting   `json:"-"`
-	Metadata     map[string]string `json:"-"`
+	ID           string `json:"id"`
+	StatusCode   int    `json:"status_code,omitempty"`
+	Payload      string `json:"payload"`
+	ErrorCode    string `json:"error_code,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	// PayloadRef names the object holding a response body stored by reference
+	// (s3://bucket/key); ContentType, PayloadSize and PayloadSHA256 describe that body.
+	PayloadRef    string            `json:"payload_ref,omitempty"`
+	ContentType   string            `json:"content_type,omitempty"`
+	PayloadSize   int64             `json:"payload_size,omitempty"`
+	PayloadSHA256 string            `json:"payload_sha256,omitempty"`
+	Routing       InternalRouting   `json:"-"`
+	Metadata      map[string]string `json:"-"`
 }
 
 // Error codes for non-HTTP failures surfaced in ResultMessage.ErrorCode.
@@ -159,6 +166,21 @@ func NewHTTPResult(req Request, routing InternalRouting, statusCode int, respons
 		Payload:    string(responseBody),
 		Routing:    routing,
 		Metadata:   req.ReqMetadata(),
+	}
+}
+
+// NewHTTPRefResult builds a ResultMessage for an HTTP response whose body was stored by
+// reference.
+func NewHTTPRefResult(req Request, routing InternalRouting, statusCode int, ref, contentType string, size int64, sha256Hex string) ResultMessage {
+	return ResultMessage{
+		ID:            req.ReqID(),
+		StatusCode:    statusCode,
+		PayloadRef:    ref,
+		ContentType:   contentType,
+		PayloadSize:   size,
+		PayloadSHA256: sha256Hex,
+		Routing:       routing,
+		Metadata:      req.ReqMetadata(),
 	}
 }
 

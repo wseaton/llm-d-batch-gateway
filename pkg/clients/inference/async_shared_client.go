@@ -174,6 +174,9 @@ func (c *asyncSharedClient) GetResults(ctx context.Context) ([]*GenerateResponse
 				ErrorCode:    r.ErrorCode,
 				ErrorMessage: r.ErrorMessage,
 			}
+			if r.PayloadRef != "" {
+				out[i].Payload = &PayloadRef{Ref: r.PayloadRef, ContentType: r.ContentType, Size: r.PayloadSize, SHA256: r.PayloadSHA256}
+			}
 		}
 		return out, nil
 	}

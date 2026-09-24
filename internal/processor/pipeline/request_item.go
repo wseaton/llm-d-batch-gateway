@@ -30,6 +30,7 @@ type ResultItem struct {
 	CustomID         string
 	ModelID          string
 	Response         *batch_types.ResponseData
+	Payload          *inference.PayloadRef // body stored by reference; the collector adopts it
 	Error            *OutputError
 	HadCapacityRetry bool
 	SubmittedAt      time.Time

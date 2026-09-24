@@ -158,6 +158,12 @@ func asyncResult(resp *inference.GenerateResponse, logger logr.Logger) ResultIte
 		statusCode = 200
 	}
 
+	if resp.Payload != nil {
+		result.Response = &batch_types.ResponseData{StatusCode: statusCode, RequestID: resp.RequestID}
+		result.Payload = resp.Payload
+		return result
+	}
+
 	if len(resp.Response) == 0 {
 		if statusCode >= 200 && statusCode < 300 {
 			result.Error = &OutputError{Code: "server_error", Message: "async response has no body"}

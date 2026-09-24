@@ -45,11 +45,21 @@ type GenerateRequest struct {
 type GenerateResponse struct {
 	RequestID        string
 	Response         []byte
-	StatusCode       int    // HTTP status from async ResultMessage; 0 = unset/non-HTTP
-	ErrorCode        string // non-HTTP failure code from async ResultMessage
-	ErrorMessage     string // non-HTTP failure message from async ResultMessage
+	Payload          *PayloadRef // set when the async dispatcher stored the body by reference
+	StatusCode       int         // HTTP status from async ResultMessage; 0 = unset/non-HTTP
+	ErrorCode        string      // non-HTTP failure code from async ResultMessage
+	ErrorMessage     string      // non-HTTP failure message from async ResultMessage
 	RawData          interface{}
 	HadCapacityRetry bool // true if any retry was caused by 429/5xx (not network error)
+}
+
+// PayloadRef names a response body the async dispatcher stored in object storage instead of
+// returning it inline.
+type PayloadRef struct {
+	Ref         string // s3://bucket/key
+	ContentType string
+	Size        int64
+	SHA256      string
 }
 
 // IsNonHTTPFailure reports whether the response represents a failure that did

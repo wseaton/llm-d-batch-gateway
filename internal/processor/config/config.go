@@ -160,6 +160,11 @@ type AsyncDispatchConfig struct {
 	// Required when DispatchMode == "async".
 	Models map[string]AsyncModelConfig `yaml:"models"`
 
+	// ResultStorePrefix is the key prefix the async dispatcher stores response bodies under
+	// (its --result-store-s3-prefix). A result referencing an object outside
+	// <prefix>/<request id>/ is rejected instead of adopted.
+	ResultStorePrefix string `yaml:"result_store_prefix"`
+
 	// SubmitBatchSize bounds how many requests are enqueued in one call.
 	// Zero uses the default.
 	SubmitBatchSize int `yaml:"submit_batch_size"`

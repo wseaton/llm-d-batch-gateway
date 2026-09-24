@@ -48,6 +48,9 @@ data:
       transport: {{ .Values.processor.config.asyncDispatch.transport | quote }}
       {{- end }}
       result_poll_timeout: {{ .Values.processor.config.asyncDispatch.resultPollTimeout | quote }}
+      {{- if .Values.processor.config.asyncDispatch.resultStorePrefix }}
+      result_store_prefix: {{ .Values.processor.config.asyncDispatch.resultStorePrefix | quote }}
+      {{- end }}
       {{- if .Values.processor.config.asyncDispatch.submitBatchSize }}
       submit_batch_size: {{ .Values.processor.config.asyncDispatch.submitBatchSize }}
       {{- end }}
