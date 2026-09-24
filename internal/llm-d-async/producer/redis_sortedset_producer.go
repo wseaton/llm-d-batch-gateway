@@ -200,6 +200,27 @@ func toInternalRequest(req api.Request) *api.InternalRequest {
 // SubmitRequest adds a request to the Redis sorted set.
 // The score is the deadline, ensuring earlier deadlines are processed first.
 func (p *RedisSortedSetProducer) SubmitRequest(ctx context.Context, req api.Request) error {
+	return p.SubmitRequests(ctx, []api.Request{req})
+}
+
+// SubmitRequests adds every request in one MULTI/EXEC. Either all are queued or none are.
+func (p *RedisSortedSetProducer) SubmitRequests(ctx context.Context, reqs []api.Request) error {
+	if len(reqs) == 0 {
+		return nil
+	}
+	pipe := p.client.TxPipeline()
+	for _, req := range reqs {
+		if err := p.queueSubmit(ctx, pipe, req); err != nil {
+			return err
+		}
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("failed to add request to queue: %w", err)
+	}
+	return nil
+}
+
+func (p *RedisSortedSetProducer) queueSubmit(ctx context.Context, pipe redis.Pipeliner, req api.Request) error {
 	if req == nil {
 		return errors.New("request is required")
 	}
@@ -247,7 +268,6 @@ func (p *RedisSortedSetProducer) SubmitRequest(ctx context.Context, req api.Requ
 	if activeTTL <= 0 {
 		return errors.New("deadline has already expired")
 	}
-	pipe := p.client.TxPipeline()
 	pipe.Del(ctx, api.RequestCancellationKey(r.ReqID()))
 	pipe.Set(ctx, api.RequestActiveTokenKey(r.ReqID()), ir.RequestToken, activeTTL)
 	pipe.Set(ctx, ir.PayloadRef, []byte(payload), activeTTL+payloadTTLGrace)
@@ -255,10 +275,6 @@ func (p *RedisSortedSetProducer) SubmitRequest(ctx context.Context, req api.Requ
 		Score:  score,
 		Member: string(envelope),
 	})
-	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("failed to add request to queue: %w", err)
-	}
-
 	return nil
 }
 

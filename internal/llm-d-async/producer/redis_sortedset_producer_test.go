@@ -90,6 +90,54 @@ func TestSubmitRequest(t *testing.T) {
 	assert.Equal(t, "test-result-queue", ir.ResultQueueName)
 }
 
+func batchRequest(id string) *api.RequestMessage {
+	return &api.RequestMessage{
+		ID:       id,
+		Created:  time.Now().Unix(),
+		Deadline: time.Now().Add(time.Hour).Unix(),
+		Payload:  testPayload(map[string]interface{}{"model": "m", "prompt": id}),
+	}
+}
+
+func TestSubmitRequestsQueuesEveryRequestWithItsPayload(t *testing.T) {
+	producer, mr := setupTestProducer(t)
+	ctx := context.Background()
+
+	require.NoError(t, producer.SubmitRequests(ctx, []api.Request{batchRequest("a"), batchRequest("b"), batchRequest("c")}))
+
+	members, err := mr.ZMembers("test-request-queue")
+	require.NoError(t, err)
+	require.Len(t, members, 3)
+	ids := map[string]bool{}
+	for _, m := range members {
+		var ir api.InternalRequest
+		require.NoError(t, json.Unmarshal([]byte(m), &ir))
+		ids[ir.PublicRequest.ReqID()] = true
+		assert.Equal(t, "test-result-queue", ir.ResultQueueName)
+		assert.True(t, mr.Exists(ir.PayloadRef), "payload for %s", ir.PublicRequest.ReqID())
+		token, err := mr.Get(api.RequestActiveTokenKey(ir.PublicRequest.ReqID()))
+		require.NoError(t, err)
+		assert.Equal(t, ir.RequestToken, token)
+	}
+	assert.Equal(t, map[string]bool{"a": true, "b": true, "c": true}, ids)
+}
+
+func TestSubmitRequestsQueuesNothingWhenOneRequestIsInvalid(t *testing.T) {
+	producer, mr := setupTestProducer(t)
+	bad := batchRequest("")
+
+	err := producer.SubmitRequests(context.Background(), []api.Request{batchRequest("a"), bad, batchRequest("c")})
+	require.Error(t, err)
+	assert.False(t, mr.Exists("test-request-queue"))
+	assert.Empty(t, mr.Keys())
+}
+
+func TestSubmitRequestsEmptyBatchIsANoOp(t *testing.T) {
+	producer, mr := setupTestProducer(t)
+	require.NoError(t, producer.SubmitRequests(context.Background(), nil))
+	assert.Empty(t, mr.Keys())
+}
+
 func TestToInternalRequest_PubSubIDCopiesToInternalRouting(t *testing.T) {
 	req := &api.PubSubRequest{
 		RequestMessage: api.RequestMessage{
