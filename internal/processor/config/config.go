@@ -151,6 +151,11 @@ type AsyncDispatchConfig struct {
 	// Models maps model names to their async dispatch targets.
 	// Required when DispatchMode == "async".
 	Models map[string]AsyncModelConfig `yaml:"models"`
+
+	// ResultStorePrefix is the key prefix the async dispatcher stores response bodies under
+	// (its --result-store-s3-prefix). A result referencing an object outside
+	// <prefix>/<request id>/ is rejected instead of adopted.
+	ResultStorePrefix string `yaml:"result_store_prefix"`
 }
 
 type ProcessorConfig struct {

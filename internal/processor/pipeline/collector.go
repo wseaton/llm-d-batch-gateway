@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -28,6 +29,12 @@ func (o *outputLine) isSuccess() bool {
 	return o.Error == nil && o.Response != nil && o.Response.StatusCode == 200
 }
 
+// PayloadAdopter turns a response body the async dispatcher stored by reference into a batch
+// output file and returns the output line's response body for it.
+type PayloadAdopter interface {
+	Adopt(ctx context.Context, item ResultItem) (map[string]any, error)
+}
+
 // ResultCollector writes ResultItem values to JSONL and records progress.
 // Terminal actor — no out channel.
 type ResultCollector struct {
@@ -37,6 +44,13 @@ type ResultCollector struct {
 	tracker              *ProgressTracker
 	logger               logr.Logger
 	onPersistenceFailure func()
+	adopter              PayloadAdopter
+}
+
+// SetPayloadAdopter lets the collector adopt response bodies stored by reference. Without one,
+// such results become error lines.
+func (c *ResultCollector) SetPayloadAdopter(a PayloadAdopter) {
+	c.adopter = a
 }
 
 func NewResultCollector(outputFile, errorFile *os.File, pending *PendingRequests, tracker *ProgressTracker, logger logr.Logger) *ResultCollector {
@@ -67,7 +81,7 @@ func (c *ResultCollector) Drain(ctx context.Context, resultCh <-chan ResultItem)
 		if firstErr != nil {
 			continue
 		}
-		if err := c.Receive(msg); err != nil {
+		if err := c.receive(ctx, msg); err != nil {
 			firstErr = err
 			c.logger.Error(err, "Persistence failure, skipping further writes")
 			if c.onPersistenceFailure != nil {
@@ -88,6 +102,13 @@ func (c *ResultCollector) Drain(ctx context.Context, resultCh <-chan ResultItem)
 }
 
 func (c *ResultCollector) Receive(msg ResultItem) error {
+	return c.receive(context.Background(), msg)
+}
+
+func (c *ResultCollector) receive(ctx context.Context, msg ResultItem) error {
+	if msg.Payload != nil {
+		c.adoptPayload(ctx, &msg)
+	}
 	line := &outputLine{
 		ID:       msg.RequestID,
 		CustomID: msg.CustomID,
@@ -173,4 +194,28 @@ func (c *ResultCollector) flushFiles() (err error) {
 		}
 	}
 	return
+}
+
+// adoptPayload replaces a stored-by-reference body with the file it becomes, or turns the
+// result into an error line when it cannot be adopted.
+func (c *ResultCollector) adoptPayload(ctx context.Context, msg *ResultItem) {
+	fail := func(code, message string) {
+		msg.Response = nil
+		msg.Error = &OutputError{Code: code, Message: message}
+	}
+	if c.adopter == nil {
+		fail("server_error", "response body was stored by reference, but no files store can adopt it")
+		return
+	}
+	body, err := c.adopter.Adopt(ctx, *msg)
+	if err != nil {
+		c.logger.Error(err, "Could not adopt a response body stored by reference", "requestID", msg.RequestID, "ref", msg.Payload.Ref)
+		if errors.Is(err, os.ErrNotExist) {
+			fail("payload_unavailable", err.Error())
+			return
+		}
+		fail("server_error", err.Error())
+		return
+	}
+	msg.Response.Body = body
 }

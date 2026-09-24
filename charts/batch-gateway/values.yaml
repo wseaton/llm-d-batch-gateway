@@ -362,6 +362,8 @@ processor:
     dispatchMode: "sync"
     asyncDispatch:
       resultPollTimeout: "30s"
+      # resultStorePrefix: the dispatcher's --result-store-s3-prefix. Response bodies it stores
+      # by reference (audio) are adopted as batch_output files; requires the s3 files store.
       models: {}
 
     # Sync mode: configure exactly one of globalInferenceGateway or modelGateways.

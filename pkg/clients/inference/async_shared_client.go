@@ -77,13 +77,17 @@ func (c *asyncSharedClient) GetResult(ctx context.Context) (*GenerateResponse, e
 		return nil, err
 	}
 
-	return &GenerateResponse{
+	resp := &GenerateResponse{
 		RequestID:    result.ID,
 		Response:     []byte(result.Payload),
 		StatusCode:   result.StatusCode,
 		ErrorCode:    result.ErrorCode,
 		ErrorMessage: result.ErrorMessage,
-	}, nil
+	}
+	if result.PayloadRef != "" {
+		resp.Payload = &PayloadRef{Ref: result.PayloadRef, ContentType: result.ContentType, Size: result.PayloadSize, SHA256: result.PayloadSHA256}
+	}
+	return resp, nil
 }
 
 func (c *asyncSharedClient) Cancel(ctx context.Context, ids []string) error {
