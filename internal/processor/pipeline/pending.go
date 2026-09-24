@@ -51,8 +51,13 @@ func (p *PendingRequests) decrement() {
 // Returns false only for broadcast results that belong to another job.
 func (p *PendingRequests) Resolve(result *ResultItem) bool {
 	if result.Error != nil {
-		if _, ok := p.m.LoadAndDelete(result.RequestID); ok {
+		if msg, ok := p.m.LoadAndDelete(result.RequestID); ok {
 			p.decrement()
+			if result.CustomID == "" {
+				result.CustomID = msg.CustomID
+				result.ModelID = msg.ModelID
+				result.SubmittedAt = msg.SubmittedAt
+			}
 			return true
 		}
 		return result.CustomID != ""

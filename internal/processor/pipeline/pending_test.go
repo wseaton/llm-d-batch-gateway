@@ -25,6 +25,33 @@ func TestPendingRequests(t *testing.T) {
 		}
 	})
 
+	t.Run("resolve enriches an async error result with request metadata", func(t *testing.T) {
+		p := NewPendingRequests(0)
+		submitted := time.Now()
+		p.Store(RequestItem{RequestID: "r1", CustomID: "c1", ModelID: "m1", SubmittedAt: submitted})
+
+		result := &ResultItem{RequestID: "r1", Error: &OutputError{Code: "INFERENCE_ERROR"}}
+		if !p.Resolve(result) {
+			t.Fatal("Resolve returned false")
+		}
+		if result.CustomID != "c1" || result.ModelID != "m1" || !result.SubmittedAt.Equal(submitted) {
+			t.Fatalf("result = %+v, want custom id c1, model m1 and the submit time", result)
+		}
+	})
+
+	t.Run("resolve keeps an error result's own metadata", func(t *testing.T) {
+		p := NewPendingRequests(0)
+		p.Store(RequestItem{RequestID: "r1", CustomID: "c1", ModelID: "m1"})
+
+		result := &ResultItem{RequestID: "r1", CustomID: "c1", ModelID: "m2", Error: &OutputError{Code: "batch_cancelled"}}
+		if !p.Resolve(result) {
+			t.Fatal("Resolve returned false")
+		}
+		if result.ModelID != "m2" {
+			t.Fatalf("ModelID = %q, want the result's own m2", result.ModelID)
+		}
+	})
+
 	t.Run("resolve returns false for unknown request", func(t *testing.T) {
 		p := NewPendingRequests(0)
 		result := &ResultItem{RequestID: "unknown"}
