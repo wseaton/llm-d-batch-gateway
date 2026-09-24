@@ -53,6 +53,8 @@ x-processor: &processor
       condition: service_healthy
     vcr:
       condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
 
 services:
   postgres:
@@ -134,7 +136,22 @@ services:
     ports:
       - "13200:3200"
 
+  migrate:
+    image: bgw-sim-apiserver:local
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.apiserver
+      args:
+        GO_BUILD_TAGS: failpoints
+    command: ["migrate"]
+    volumes:
+      - ./secrets/apiserver:/etc/.secrets:ro
+    depends_on:
+      toxiproxy:
+        condition: service_healthy
+
   apiserver:
+    image: bgw-sim-apiserver:local
     build:
       context: ../..
       dockerfile: docker/Dockerfile.apiserver
@@ -155,6 +172,8 @@ services:
     depends_on:
       toxiproxy:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   # One processor per StatefulSet-style identity. The replicas profile adds
   # two more; the zombie profile starts a second process with processor-0's
@@ -207,6 +226,8 @@ services:
     depends_on:
       toxiproxy:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   hf-cache:

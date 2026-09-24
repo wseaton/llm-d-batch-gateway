@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/database/api"
+	"github.com/llm-d/llm-d-batch-gateway/internal/database/postgresql/migrate"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/logging"
 )
 
@@ -118,7 +119,17 @@ func newEventPool(ctx context.Context, config *PostgreSQLConfig) (*pgxpool.Pool,
 		return nil, fmt.Errorf("postgresql config cannot be nil")
 	}
 
-	return newPool(ctx, config)
+	pool, err := newPool(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := migrate.Check(ctx, pool); err != nil {
+		pool.Close()
+		return nil, err
+	}
+
+	return pool, nil
 }
 
 func (c *PostgresBatchEventClient) Close() error {

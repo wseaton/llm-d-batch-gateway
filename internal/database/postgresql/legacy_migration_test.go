@@ -2,6 +2,7 @@ package postgresql
 
 import (
 	"context"
+	"github.com/llm-d/llm-d-batch-gateway/internal/database/postgresql/migrate"
 	"os"
 	"strconv"
 	"testing"
@@ -54,10 +55,16 @@ func TestLegacyRowsAfterMigration(t *testing.T) {
 		}
 	}
 
+	if _, err := pool.Exec(ctx, "DROP TABLE IF EXISTS schema_migrations, batch_events"); err != nil {
+		t.Fatalf("drop tables a pre-migration database lacks: %v", err)
+	}
+	if _, err := migrate.Run(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
 	cfg := &PostgreSQLConfig{Url: url}
 	batchDB, err := NewPostgresBatchDBClient(ctx, cfg)
 	if err != nil {
-		t.Fatalf("NewPostgresBatchDBClient (migration): %v", err)
+		t.Fatalf("NewPostgresBatchDBClient: %v", err)
 	}
 	t.Cleanup(func() { _ = batchDB.Close() })
 	queue, err := NewPostgresBatchQueueClient(ctx, cfg, "processor-0")

@@ -30,6 +30,7 @@ import (
 	"github.com/pashagolub/pgxmock/v5"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/database/api"
+	"github.com/llm-d/llm-d-batch-gateway/internal/database/postgresql/migrate"
 )
 
 func TestBatchEventValidation(t *testing.T) {
@@ -334,7 +335,22 @@ func requirePostgresURL(t *testing.T) string {
 	if url == "" {
 		t.Skip("TEST_POSTGRES_URL not set")
 	}
+	migrateForTest(t, url)
 	return url
+}
+
+// migrateForTest applies the schema migrations, as a deployment's migrate step does.
+func migrateForTest(t *testing.T, url string) {
+	t.Helper()
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatalf("pgxpool: %v", err)
+	}
+	defer pool.Close()
+	if _, err := migrate.Run(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
 }
 
 // TestPostgresBatchEventClient_RoundTrip requires a real PostgreSQL instance
