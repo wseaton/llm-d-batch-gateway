@@ -8,7 +8,9 @@ type AsyncInferenceClient interface {
 	// SubmitBatch enqueues a batch of requests, returning one error slot per
 	// request in the order given; a nil slot means that request was enqueued.
 	SubmitBatch(ctx context.Context, reqs []*GenerateRequest) []*ClientError
-	GetResult(ctx context.Context) (*GenerateResponse, error)
+	// GetResults blocks until at least one result is available and returns
+	// every result ready at that point, up to a transport-specific batch.
+	GetResults(ctx context.Context) ([]*GenerateResponse, error)
 	// Cancel marks all still-pending submitted requests as cancelled in the
 	// dispatcher (best-effort pre-dispatch). It does not unregister waiters;
 	// callers should still Close after local drain.

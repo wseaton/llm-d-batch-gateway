@@ -65,12 +65,12 @@ func (c *fakeAsyncClient) SubmitBatch(ctx context.Context, reqs []*inference.Gen
 	return make([]*inference.ClientError, len(reqs))
 }
 
-func (c *fakeAsyncClient) GetResult(ctx context.Context) (*inference.GenerateResponse, error) {
+func (c *fakeAsyncClient) GetResults(ctx context.Context) ([]*inference.GenerateResponse, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case r := <-c.results:
-		return r, nil
+		return []*inference.GenerateResponse{r}, nil
 	}
 }
 
@@ -401,8 +401,12 @@ func (c *fakeAsyncClientWithErrors) SubmitBatch(_ context.Context, reqs []*infer
 	return make([]*inference.ClientError, len(reqs))
 }
 
-func (c *fakeAsyncClientWithErrors) GetResult(ctx context.Context) (*inference.GenerateResponse, error) {
-	return c.getResult(ctx)
+func (c *fakeAsyncClientWithErrors) GetResults(ctx context.Context) ([]*inference.GenerateResponse, error) {
+	r, err := c.getResult(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return []*inference.GenerateResponse{r}, nil
 }
 
 func (c *fakeAsyncClientWithErrors) Cancel(_ context.Context, _ []string) error { return nil }

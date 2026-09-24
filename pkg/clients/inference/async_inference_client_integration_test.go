@@ -75,7 +75,7 @@ func TestAsyncSharedClient_Submit_roundtrip(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		resp, getErr := client.GetResult(ctx)
+		resp, getErr := getOne(t, client, ctx)
 		if getErr != nil {
 			t.Fatalf("GetResult error: %v", getErr)
 		}
@@ -145,7 +145,7 @@ func TestAsyncSharedClient_Submit_roundtrip(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		resp, getErr := client.GetResult(ctx)
+		resp, getErr := getOne(t, client, ctx)
 		if getErr != nil {
 			t.Fatalf("GetResult error: %v", getErr)
 		}

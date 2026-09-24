@@ -251,7 +251,7 @@ func TestNewAsyncResolver(t *testing.T) {
 		pushResult(queueB, "request-b")
 		pushResult(queueA, "request-a")
 
-		resultA, err := clientA.GetResult(context.Background())
+		resultA, err := getOne(t, clientA, context.Background())
 		if err != nil {
 			t.Fatalf("consumer A GetResult: %v", err)
 		}
@@ -259,7 +259,7 @@ func TestNewAsyncResolver(t *testing.T) {
 			t.Fatalf("consumer A received %q, want request-a", resultA.RequestID)
 		}
 
-		resultB, err := clientB.GetResult(context.Background())
+		resultB, err := getOne(t, clientB, context.Background())
 		if err != nil {
 			t.Fatalf("consumer B GetResult: %v", err)
 		}

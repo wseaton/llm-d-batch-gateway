@@ -137,7 +137,11 @@ func TestAsyncSharedClient_GetResultWaitsPastEmptyPolls(t *testing.T) {
 	done := make(chan got, 1)
 	start := time.Now()
 	go func() {
-		resp, err := client.GetResult(ctx)
+		resps, err := client.GetResults(ctx)
+		var resp *GenerateResponse
+		if len(resps) > 0 {
+			resp = resps[0]
+		}
 		done <- got{resp, err}
 	}()
 
@@ -157,5 +161,57 @@ func TestAsyncSharedClient_GetResultWaitsPastEmptyPolls(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < 700*time.Millisecond {
 		t.Fatalf("GetResult returned after %v, before the result existed", elapsed)
+	}
+}
+
+// The sql producer reads results in batches, so a backlog drains in a few
+// round trips instead of one per result.
+func TestAsyncSharedClient_GetResultsReadsBatches(t *testing.T) {
+	dsn := os.Getenv("TEST_POSTGRES_URL")
+	if dsn == "" {
+		t.Skip("TEST_POSTGRES_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	const route = "batch-read-results"
+	p, err := producersql.New(ctx, producersql.Config{URL: dsn, RequestQueueName: "batch-read-requests", ResultQueueName: route})
+	if err != nil {
+		t.Fatalf("producersql.New: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.ExecContext(ctx, `DELETE FROM async_results WHERE route = $1`, route); err != nil {
+		t.Fatalf("clear results: %v", err)
+	}
+	const backlog = resultReadBatch + 44
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO async_results (route, id, request_token, payload, expires_at, created_at)
+SELECT $1, 'r-' || g, 't-' || g, '{"id":"r-' || g || '","payload":"ok","status_code":200}', 0, 0 FROM generate_series(1, $2) g`,
+		route, backlog); err != nil {
+		t.Fatalf("insert results: %v", err)
+	}
+
+	client := newAsyncSharedClient(p, time.Second, testLogger(t))
+	seen := map[string]bool{}
+	var sizes []int
+	for len(seen) < backlog {
+		resps, err := client.GetResults(ctx)
+		if err != nil {
+			t.Fatalf("GetResults: %v", err)
+		}
+		sizes = append(sizes, len(resps))
+		for _, r := range resps {
+			if seen[r.RequestID] {
+				t.Fatalf("result %s returned twice", r.RequestID)
+			}
+			seen[r.RequestID] = true
+		}
+	}
+	if len(sizes) != 2 || sizes[0] != resultReadBatch || sizes[1] != 44 {
+		t.Fatalf("read sizes = %v, want [%d 44]", sizes, resultReadBatch)
 	}
 }

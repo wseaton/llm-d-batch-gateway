@@ -207,3 +207,16 @@ func TestAsyncSharedClient_Cancel(t *testing.T) {
 		}
 	})
 }
+
+// getOne reads one batch of results and requires it to hold exactly one.
+func getOne(t *testing.T, c AsyncInferenceClient, ctx context.Context) (*GenerateResponse, error) {
+	t.Helper()
+	resps, err := c.GetResults(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(resps) != 1 {
+		t.Fatalf("GetResults returned %d results, want 1", len(resps))
+	}
+	return resps[0], nil
+}

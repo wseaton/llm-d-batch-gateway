@@ -45,6 +45,16 @@ type batchSubmitter interface {
 	SubmitRequests(ctx context.Context, reqs []asyncapi.Request) error
 }
 
+// resultReadBatch is the most results one read returns from a producer that
+// can read several per round trip.
+const resultReadBatch = 256
+
+// batchReader reads up to limit results in one round trip. The sql producer
+// does; the redis producers read one at a time.
+type batchReader interface {
+	GetResults(ctx context.Context, limit int) ([]*asyncapi.ResultMessage, error)
+}
+
 func (c *asyncSharedClient) requestMessage(ctx context.Context, req *GenerateRequest) (*asyncapi.RequestMessage, *ClientError) {
 	payload, err := json.Marshal(req.Params)
 	if err != nil {
@@ -143,12 +153,10 @@ func (c *asyncSharedClient) SubmitBatch(ctx context.Context, reqs []*GenerateReq
 	return errs
 }
 
-func (c *asyncSharedClient) GetResult(ctx context.Context) (*GenerateResponse, error) {
-	var result *asyncapi.ResultMessage
+func (c *asyncSharedClient) GetResults(ctx context.Context) ([]*GenerateResponse, error) {
 	for {
 		pollCtx, pollCancel := context.WithTimeout(ctx, c.pollTimeout)
-		var err error
-		result, err = c.producer.GetResult(pollCtx)
+		results, err := c.read(pollCtx)
 		empty := err != nil && ctx.Err() == nil && errors.Is(pollCtx.Err(), context.DeadlineExceeded)
 		pollCancel()
 		if empty {
@@ -157,16 +165,29 @@ func (c *asyncSharedClient) GetResult(ctx context.Context) (*GenerateResponse, e
 		if err != nil {
 			return nil, err
 		}
-		break
+		out := make([]*GenerateResponse, len(results))
+		for i, r := range results {
+			out[i] = &GenerateResponse{
+				RequestID:    r.ID,
+				Response:     []byte(r.Payload),
+				StatusCode:   r.StatusCode,
+				ErrorCode:    r.ErrorCode,
+				ErrorMessage: r.ErrorMessage,
+			}
+		}
+		return out, nil
 	}
+}
 
-	return &GenerateResponse{
-		RequestID:    result.ID,
-		Response:     []byte(result.Payload),
-		StatusCode:   result.StatusCode,
-		ErrorCode:    result.ErrorCode,
-		ErrorMessage: result.ErrorMessage,
-	}, nil
+func (c *asyncSharedClient) read(ctx context.Context) ([]*asyncapi.ResultMessage, error) {
+	if br, ok := c.producer.(batchReader); ok {
+		return br.GetResults(ctx, resultReadBatch)
+	}
+	r, err := c.producer.GetResult(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return []*asyncapi.ResultMessage{r}, nil
 }
 
 func (c *asyncSharedClient) Cancel(ctx context.Context, ids []string) error {
