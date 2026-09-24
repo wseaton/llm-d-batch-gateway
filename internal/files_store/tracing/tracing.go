@@ -19,6 +19,7 @@ package tracing
 
 import (
 	"context"
+	"errors"
 	"io"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -103,6 +104,29 @@ func (r *tracedReadCloser) Close() error {
 		r.span.SetStatus(codes.Error, "close failed")
 	}
 	return err
+}
+
+// Adopt traces the inner client's Adopt; it returns errors.ErrUnsupported when the inner
+// backend cannot adopt objects.
+func (c *Client) Adopt(ctx context.Context, sourceRef, fileName, folderName string) (*api.BatchFileMetadata, error) {
+	adopter, ok := c.inner.(api.ObjectAdopter)
+	if !ok {
+		return nil, errors.ErrUnsupported
+	}
+	ctx, span := uotel.StartSpan(ctx, "storage.Adopt")
+	defer span.End()
+	span.SetAttributes(
+		c.backend,
+		attribute.String("storage.source", sourceRef),
+		attribute.String("storage.file_name", fileName),
+		attribute.String("storage.folder", folderName),
+	)
+	meta, err := adopter.Adopt(ctx, sourceRef, fileName, folderName)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "adopt failed")
+	}
+	return meta, err
 }
 
 func (c *Client) Delete(ctx context.Context, fileName, folderName string) error {

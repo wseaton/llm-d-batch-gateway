@@ -127,6 +127,10 @@ func (m *mockS3Client) DeleteObject(_ context.Context, params *s3.DeleteObjectIn
 	return &s3.DeleteObjectOutput{}, nil
 }
 
+func (m *mockS3Client) CopyObject(_ context.Context, _ *s3.CopyObjectInput, _ ...func(*s3.Options)) (*s3.CopyObjectOutput, error) {
+	return nil, errors.New("CopyObject is exercised against a real S3 endpoint in test/integration")
+}
+
 func (m *mockS3Client) ListObjectsV2(_ context.Context, params *s3.ListObjectsV2Input, _ ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
 	if m.listErr != nil {
 		return nil, m.listErr

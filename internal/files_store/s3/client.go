@@ -22,7 +22,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -31,6 +33,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
 	fsio "github.com/llm-d/llm-d-batch-gateway/internal/files_store/io"
@@ -45,6 +48,7 @@ type s3API interface {
 	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 	HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
 	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	CopyObject(ctx context.Context, params *s3.CopyObjectInput, optFns ...func(*s3.Options)) (*s3.CopyObjectOutput, error)
 	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
 	CreateBucket(ctx context.Context, params *s3.CreateBucketInput, optFns ...func(*s3.Options)) (*s3.CreateBucketOutput, error)
 	HeadBucket(ctx context.Context, params *s3.HeadBucketInput, optFns ...func(*s3.Options)) (*s3.HeadBucketOutput, error)
@@ -64,7 +68,10 @@ type Client struct {
 	bucket   string
 }
 
-var _ api.BatchFilesClient = (*Client)(nil)
+var (
+	_ api.BatchFilesClient = (*Client)(nil)
+	_ api.ObjectAdopter    = (*Client)(nil)
+)
 
 // Config holds configuration for the S3 client.
 type Config struct {
@@ -263,15 +270,58 @@ func (c *Client) Retrieve(ctx context.Context, fileName, folderName string) (io.
 	}
 
 	metadata := &api.BatchFileMetadata{
-		Location: key,
-		Size:     size,
-		ModTime:  modTime,
+		Location:    key,
+		Size:        size,
+		ModTime:     modTime,
+		ContentType: aws.ToString(out.ContentType),
 	}
 
 	logr.FromContextOrDiscard(ctx).V(logging.INFO).Info("File retrieved successfully",
 		"bucket", c.bucket, "key", key, "size", metadata.Size)
 
 	return out.Body, metadata, nil
+}
+
+// Adopt copies the object sourceRef names to fileName in folderName inside the same bucket,
+// keeping its Content-Type, then deletes the source. References to other buckets are refused.
+func (c *Client) Adopt(ctx context.Context, sourceRef, fileName, folderName string) (*api.BatchFileMetadata, error) {
+	bucket, srcKey, ok := strings.Cut(strings.TrimPrefix(sourceRef, "s3://"), "/")
+	if !strings.HasPrefix(sourceRef, "s3://") || !ok || srcKey == "" {
+		return nil, fmt.Errorf("adopt %q: not an s3://bucket/key reference", sourceRef)
+	}
+	if bucket != c.bucket {
+		return nil, fmt.Errorf("adopt %q: object is outside the files bucket %s", sourceRef, c.bucket)
+	}
+	key := c.buildKey(folderName, fileName)
+	out, err := c.s3Client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(c.bucket),
+		Key:        aws.String(key),
+		CopySource: aws.String(c.bucket + "/" + escapeKey(srcKey)),
+	})
+	if err != nil {
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchKey" {
+			return nil, fmt.Errorf("adopt %q: %w", sourceRef, os.ErrNotExist)
+		}
+		return nil, fmt.Errorf("adopt %q: copy to %s: %w", sourceRef, key, err)
+	}
+	if _, err := c.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(srcKey)}); err != nil {
+		logr.FromContextOrDiscard(ctx).Error(err, "Adopted object's source was not deleted", "source", sourceRef)
+	}
+	modTime := time.Now()
+	if out.CopyObjectResult != nil && out.CopyObjectResult.LastModified != nil {
+		modTime = *out.CopyObjectResult.LastModified
+	}
+	return &api.BatchFileMetadata{Location: key, ModTime: modTime}, nil
+}
+
+// escapeKey URL-encodes each segment of an object key for CopySource.
+func escapeKey(key string) string {
+	parts := strings.Split(key, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return strings.Join(parts, "/")
 }
 
 // Delete deletes a file from S3.
