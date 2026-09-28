@@ -42,7 +42,7 @@ This script:
 | `POSTGRESQL_RELEASE`  | `postgresql`                               | Helm release name for PostgreSQL                   |
 | `POSTGRESQL_PASSWORD` | `postgres`                                 | PostgreSQL admin password                          |
 | `INFERENCE_API_KEY`   | `dummy-api-key`                            | API key written to the app secret                  |
-| `S3_SECRET_ACCESS_KEY`| `minioadmin`                               | S3 secret access key written to the app secret     |
+| `S3_SECRET_ACCESS_KEY`| `s3secret`                                 | S3 secret access key written to the app secret     |
 | `APP_SECRET_NAME`     | `<HELM_RELEASE>-secrets`                   | Name of the Kubernetes secret created by the script|
 | `FILES_PVC_NAME`      | `<HELM_RELEASE>-files`                     | Name of the PVC created for file storage           |
 | `VLLM_SIM_NAME`       | `vllm-sim`                                 | Name of the vLLM simulator deployment              |
@@ -50,6 +50,8 @@ This script:
 | `VLLM_SIM_IMAGE`      | `ghcr.io/neuralmagic/vllm-vcr:0.2.2-vllm0.27` | vllm-vcr image                                  |
 | `VLLM_SIM_HF_MODEL`   | `Qwen/Qwen2.5-0.5B-Instruct`               | Hugging Face id the frontend loads the tokenizer from |
 | `VLLM_SIM_CONTROL_PORT` | `8001`                                   | vllm-vcr control API port (latency, failure injection, request counters) |
+
+> **Note:** SeaweedFS replaced MinIO as the S3-compatible store (exposed on `localhost:9002`). This is a hard switch with no migration: the `MINIO_*` variables are no longer read, the default credentials changed from `minioadmin` to `s3admin`/`s3secret`, and `make dev-clean` no longer removes an existing `minio` Deployment/Service. On a cluster deployed before the switch, recreate the kind cluster or delete the `minio` resources manually.
 
 Example with overrides:
 
@@ -95,6 +97,23 @@ If you run `go test` directly instead of `make test-e2e`, the test helpers will 
 TEST_PROCESSOR_OBS_URL=http://127.0.0.1:19090 \
 go test -v ./test/e2e/...
 ```
+
+### Async dispatcher tests
+
+Deploy the composed Batch Gateway and llm-d Async path, then run the dispatcher suite:
+
+```bash
+ENABLE_DISPATCHER=true make dev-deploy
+ENABLE_DISPATCHER=true make test-e2e TEST_RUN=TestDispatcher
+```
+
+The harness pins the official llm-d Async v0.9.1 release image, including its multi-architecture manifest digest: `ghcr.io/llm-d/llm-d-async:v0.9.1@sha256:d8db64675b6a5f70486d74de9f28aa2ee88e7e2c4e3ba97ba2078d634c2fd610`. It also pins chart v0.9.1 and verifies that every running dispatcher pod has both the expected image reference and runtime `imageID`. Local source builds remain preloaded into Kind with `imagePullPolicy: Never`; the released image uses `IfNotPresent` so Kubernetes resolves the immutable `tag@digest` reference.
+
+`TestDispatcher/BatchAPIHardKillRecovery` covers the composed Kubernetes path from the Files and Batch APIs through the Batch Processor, Async, inference, the Processor's replica-specific result queue, and durable output/error files. It complements llm-d Async PR #412's in-process/miniredis component coverage by force-deleting the sole Async pod only after every request is durably claimed, then verifying lease takeover, terminal counts, files, and externally visible deduplication.
+
+The v0.9.1 chart exposes Async's canonical `ap.transport` and `ap.transportConfig` values, including the claim lease and reclaim intervals used by the test. Production durability additionally requires persistent Redis through AOF and/or replication. Roll out claim-aware Async replicas before relying on hard-kill recovery; an older replica can still destructively dequeue work during a mixed-version rollout.
+
+Chart v0.9.1 renames the dispatcher Deployment and its immutable selector from `async-processor` to `llm-d-async`. A clean E2E deployment needs no migration, but an existing local cluster previously deployed with chart 0.7.4 must remove the three old test releases before redeploying: `helm uninstall dispatcher dispatcher-scrape dispatcher-prom --namespace default`.
 
 ### Tests that need GIE
 

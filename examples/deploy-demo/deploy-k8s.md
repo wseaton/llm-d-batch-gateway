@@ -27,11 +27,12 @@ bash examples/deploy-demo/deploy-k8s.sh install
 | Kuadrant | Auth + rate limiting (installed via Helm) |
 | Redis | Exchange backend (Bitnami Helm chart, configurable via `BATCH_EXCHANGE_CLIENT_TYPE`) |
 | PostgreSQL | Batch metadata store (Bitnami Helm chart) |
-| MinIO | S3-compatible file storage (when `BATCH_STORAGE_TYPE=s3`) |
+| SeaweedFS | S3-compatible file storage (when `BATCH_STORAGE_TYPE=s3`) |
 | Internal Gateway | ClusterIP gateway for batch processor → LLM inference (bypasses rate limits, preserves AuthPolicy) |
 | InferenceObjective | GIE flow control CRDs — priority-based dispatch (interactive=100, batch=-1). Enabled by default (`ENABLE_FLOW_CONTROL=true`) |
 | batch-gateway | apiserver + processor + gc (Helm chart) |
-| async-processor | llm-d-async dispatcher for async dispatch mode (when `ENABLE_DISPATCHER=true`). Routes requests through Redis queues → Internal Gateway → EPP |
+| async-processor | Optional llm-d-async dispatcher for async dispatch mode (`ENABLE_DISPATCHER=true`). Routes requests through Redis queues → Internal Gateway → EPP |
+| Prometheus | Scrapes EPP + vLLM metrics for the async dispatch budget (when `ENABLE_DISPATCHER=true`) |
 
 #### Routing & Policies
 
@@ -54,19 +55,26 @@ Batch-route has no authorization — model-level authz is enforced downstream wh
 
 | Mode | Command |
 |------|---------|
-| Local chart (default) | `bash examples/deploy-demo/deploy-k8s.sh install` |
-| Chart from a specific commit | `BATCH_DEV_VERSION=1f925ff bash examples/deploy-demo/deploy-k8s.sh install` |
-| Released OCI chart | `BATCH_RELEASE_VERSION=v0.1.0 bash examples/deploy-demo/deploy-k8s.sh install` |
-| Custom images | `BATCH_IMAGE_TAG=v0.2.0` <br> `BATCH_APISERVER_REPO=ghcr.io/llm-d/batch-gateway-apiserver` <br> `BATCH_PROCESSOR_REPO=ghcr.io/llm-d/batch-gateway-processor` <br> `BATCH_GC_REPO=ghcr.io/llm-d/batch-gateway-gc` <br> `bash examples/deploy-demo/deploy-k8s.sh install` |
-| With async dispatcher | `ENABLE_DISPATCHER=true bash examples/deploy-demo/deploy-k8s.sh install` |
+| Local chart (default HTTP sync) | `bash examples/deploy-demo/deploy-k8s.sh install` |
+| Async dispatch (opt-in) | `ENABLE_DISPATCHER=true bash examples/deploy-demo/deploy-k8s.sh install` |
+| Older commit chart (HTTP sync) | `BATCH_DEV_VERSION=1f925ff ENABLE_FLOW_CONTROL=false bash examples/deploy-demo/deploy-k8s.sh install` |
+| Released OCI chart | `BATCH_RELEASE_VERSION=v0.5.0 bash examples/deploy-demo/deploy-k8s.sh install` |
+| Custom images (HTTP sync) | `BATCH_IMAGE_TAG=v0.2.0` <br> `BATCH_APISERVER_REPO=ghcr.io/llm-d/batch-gateway-apiserver` <br> `BATCH_PROCESSOR_REPO=ghcr.io/llm-d/batch-gateway-processor` <br> `BATCH_GC_REPO=ghcr.io/llm-d/batch-gateway-gc` <br> `bash examples/deploy-demo/deploy-k8s.sh install` |
+| Explicit HTTP sync (no dispatcher) | `ENABLE_DISPATCHER=false bash examples/deploy-demo/deploy-k8s.sh install` |
 
 > `BATCH_RELEASE_VERSION` and `BATCH_DEV_VERSION` cannot be used together. See [Environment Variables](#environment-variables) for common parameters.
+
+By default, the demo explicitly sets `processor.config.dispatchMode=sync` and uses normal HTTP routing through `modelGateways`. Setting `ENABLE_DISPATCHER=true` opts into async dispatch, which uses `processor.config.asyncDispatch.models` for model-to-pool mappings and flow-control objectives. API clients and the direct inference HTTP path are unchanged.
+
+Released charts `v0.3.0` and `v0.4.0` use the older async `modelGateways` layout; the script handles those exact versions. Charts `v0.1.0` and `v0.2.0` require `ENABLE_DISPATCHER=false` because they do not support async dispatch. For `v0.1.0`, also set `ENABLE_FLOW_CONTROL=false` because its objective configuration predates per-model objectives. Arbitrary older commit charts or mismatched image/chart versions are not auto-detected.
 
 ### test
 
 ```bash
 bash examples/deploy-demo/deploy-k8s.sh test
 ```
+
+Use the same environment overrides for `install` and `test`, including `ENABLE_DISPATCHER=true` for an async deployment and `BATCH_RELEASE_VERSION` for a released chart.
 
 Creates temporary ServiceAccounts (authorized + unauthorized) with short-lived tokens and runs the following test groups:
 
@@ -92,7 +100,7 @@ bash examples/deploy-demo/deploy-k8s.sh uninstall
 Default `uninstall` removes the batch-gateway footprint and associated gateway/policy resources:
 
 - Dispatcher Helm release (if deployed)
-- Helm releases and CRs in `BATCH_NAMESPACE` (`batch-route` HTTPRoute, Redis, PostgreSQL, MinIO)
+- Helm releases and CRs in `BATCH_NAMESPACE` (`batch-route` HTTPRoute, Redis, PostgreSQL, SeaweedFS)
 - Both Gateways: `GATEWAY_NAME` and `BATCH_INTERNAL_GATEWAY_NAME`
 - DestinationRule `${BATCH_INSTANCE_NAME}-backend-tls`
 - Internal Gateway resources (`batch-llm-route`, `batch-llm-route-auth`) in `LLM_NAMESPACE`
@@ -116,6 +124,8 @@ Use that only on **ephemeral or dedicated** demo clusters. See [issue #309](http
 
 ## Environment Variables
 
+> **Note:** SeaweedFS replaced MinIO as the S3-compatible store. This is a hard switch with no migration: the `MINIO_*` variables are no longer read (use the `S3_*` / `SEAWEEDFS_*` variables below), the default credentials changed from `minioadmin` to `s3admin`/`s3secret`, and `uninstall` no longer removes an existing `minio` Deployment/Service. On a cluster deployed before the switch, run `uninstall` and reinstall, and delete any leftover `minio` resources manually.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BATCH_INSTANCE_NAME` | `batch-gateway` | Helm release / instance name |
@@ -127,8 +137,13 @@ Use that only on **ephemeral or dedicated** demo clusters. See [issue #309](http
 | `BATCH_GC_REPO` | — | Override gc image repository |
 | `BATCH_DB_TYPE` | `postgresql` | Database backend: `postgresql` or `redis` |
 | `BATCH_STORAGE_TYPE` | `s3` | File storage: `fs` or `s3` |
-| `MINIO_BUCKET` | `llm-d-batch-gateway` | MinIO bucket name (also used as the S3 `bucket` and `prefix` config values) |
-| `MINIO_REGION` | `us-east-1` | S3 region for MinIO |
+| `BATCH_S3_STORE_RELEASE` | `seaweedfs` | SeaweedFS Deployment and Service name |
+| `SEAWEEDFS_IMAGE` | `ghcr.io/chrislusf/seaweedfs:4.47` | SeaweedFS container image |
+| `SEAWEEDFS_S3_PORT` | `8333` | SeaweedFS S3 API port |
+| `S3_BUCKET` | `llm-d-batch-gateway` | S3 bucket name (also used as the `bucket` and `prefix` values) |
+| `S3_REGION` | `us-east-1` | S3 region for SeaweedFS |
+| `S3_ACCESS_KEY` | `s3admin` | S3 access key for SeaweedFS |
+| `S3_SECRET_ACCESS_KEY` | `s3secret` | S3 secret key for SeaweedFS |
 | `DEMO_TLS_INSECURE_SKIP_VERIFY` | `1` | Disables TLS certificate verification for processor → model gateway and Istio Gateway → batch apiserver (**demo/lab only**, [CWE-295](https://cwe.mitre.org/data/definitions/295.html)). Default `1` since demo scripts use self-signed certs. Set to `0` if you have trusted CA certs. |
 | `BATCH_NAMESPACE` | `batch-api` | Namespace for batch-gateway |
 | `LLM_NAMESPACE` | `llm` | Namespace for model serving |
@@ -152,6 +167,6 @@ Use that only on **ephemeral or dedicated** demo clusters. See [issue #309](http
 | `ISTIO_VERSION` | `1.29.2` | Istio Helm chart version |
 | `ENABLE_FLOW_CONTROL` | `true` | Enable GIE priority-based flow control |
 | `BATCH_FLOW_CONTROL_OBJECTIVE` | `batch-sheddable` | InferenceObjective name for batch requests (priority -1) |
-| `ENABLE_DISPATCHER` | `false` | Deploy llm-d-async dispatcher for async dispatch mode |
+| `ENABLE_DISPATCHER` | `false` | Use normal HTTP sync dispatch by default; set `true` to deploy llm-d-async and Prometheus for async dispatch |
 | `DISPATCHER_VERSION` | `v0.7.3` | llm-d-async version (image tag and chart version) |
 | `UNINSTALL_ALL` | `0` | Set to `1` to remove Kuadrant, Istio, cert-manager, CRDs (ephemeral clusters only) |

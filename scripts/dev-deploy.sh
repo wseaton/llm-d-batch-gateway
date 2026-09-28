@@ -14,14 +14,13 @@ IMAGE_TAG="${IMAGE_TAG:-0.0.1}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
 POSTGRESQL_PASSWORD="${POSTGRESQL_PASSWORD:-postgres}"
 INFERENCE_API_KEY="${INFERENCE_API_KEY:-dummy-api-key}"
-S3_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:-minioadmin}"
+S3_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:-s3secret}"
 FILE_CLIENT_TYPE="${FILE_CLIENT_TYPE:-s3}"
 DB_CLIENT_TYPE="${DB_CLIENT_TYPE:-postgresql}"
-MINIO_IMAGE="${MINIO_IMAGE:-${IMAGE_REGISTRY}/minio/minio:latest}"
-MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-minioadmin}"
-MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-minioadmin}"
-MINIO_REGION="${MINIO_REGION:-us-east-1}"
-MINIO_BUCKET="${MINIO_BUCKET:-llm-d-batch-gateway}"
+SEAWEEDFS_IMAGE="${SEAWEEDFS_IMAGE:-ghcr.io/chrislusf/seaweedfs:4.47}"
+S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
+S3_REGION="${S3_REGION:-us-east-1}"
+S3_BUCKET="${S3_BUCKET:-llm-d-batch-gateway}"
 VLLM_SIM_MODEL="${VLLM_SIM_MODEL:-sim-model}"
 VLLM_SIM_B_MODEL="${VLLM_SIM_B_MODEL:-sim-model-b}"
 # Inference backend: vllm-vcr (the real vLLM Rust frontend over a simulated
@@ -42,7 +41,7 @@ GC_METRICS_PORT="${GC_METRICS_PORT:-9091}"
 JAEGER_NODE_PORT="${JAEGER_NODE_PORT:-30086}"
 PROMETHEUS_NODE_PORT="${PROMETHEUS_NODE_PORT:-30091}"
 GRAFANA_NODE_PORT="${GRAFANA_NODE_PORT:-30030}"
-MINIO_NODE_PORT="${MINIO_NODE_PORT:-30009}"
+SEAWEEDFS_NODE_PORT="${SEAWEEDFS_NODE_PORT:-30009}"
 APISERVER_IMG="${APISERVER_IMG:-ghcr.io/llm-d/batch-gateway-apiserver:${IMAGE_TAG}}"
 PROCESSOR_IMG="${PROCESSOR_IMG:-ghcr.io/llm-d/batch-gateway-processor:${IMAGE_TAG}}"
 GC_IMG="${GC_IMG:-ghcr.io/llm-d/batch-gateway-gc:${IMAGE_TAG}}"
@@ -65,8 +64,8 @@ USE_KIND="${USE_KIND:-true}"
 ENABLE_GIE="${ENABLE_GIE:-false}"
 
 # ── Async dispatcher (llm-d-async) support ──────────────────────────────────
-# Set ENABLE_DISPATCHER=true to deploy llm-d-async dispatcher instances
-# alongside the batch-gateway. The processor is reconfigured for async dispatch.
+# Use sync dispatch by default. Set ENABLE_DISPATCHER=true to deploy the
+# llm-d-async dev fixtures; sync dispatch is required for GIE and custom layouts.
 # Set DISPATCHER_SOURCE to a local llm-d-async checkout to build from source.
 ENABLE_DISPATCHER="${ENABLE_DISPATCHER:-false}"
 GIE_REPO="${GIE_REPO:-}"
@@ -96,14 +95,47 @@ detect_container_tool() {
 
 check_prerequisites() {
     step "Checking prerequisites..."
+    case "${ENABLE_DISPATCHER}" in
+        true|false) ;;
+        *) die "ENABLE_DISPATCHER must be true or false." ;;
+    esac
+    if [ "${ENABLE_DISPATCHER}" = "true" ]; then
+        if [ "${ENABLE_GIE}" = "true" ]; then
+            die "ENABLE_GIE=true cannot be combined with ENABLE_DISPATCHER=true. Use 'make dev-deploy-gie' or ENABLE_DISPATCHER=false ENABLE_GIE=true make dev-deploy for sync GIE."
+        fi
+        # These restrictions belong to the fixed dev/E2E fixtures, not the chart.
+        local setting
+        for setting in USE_KIND=true NAMESPACE=default EXCHANGE_CLIENT_TYPE=redis \
+            REDIS_RELEASE=redis VLLM_SIM_NAME=vllm-sim VLLM_SIM_B_NAME=vllm-sim-b \
+            VLLM_SIM_MODEL=sim-model VLLM_SIM_B_MODEL=sim-model-b \
+            JAEGER_NAME=jaeger PROMETHEUS_NAME=prometheus; do
+            local name="${setting%%=*}" expected="${setting#*=}"
+            if [ "${!name}" != "${expected}" ]; then
+                die "Async dev fixtures require ${setting} (got ${!name}). Set ENABLE_DISPATCHER=false for explicit sync deployment with custom settings."
+            fi
+        done
+        if [ "${KIND_EXPERIMENTAL_PROVIDER:-docker}" != "docker" ]; then
+            die "Async dev image loading requires Docker-backed kind. Set ENABLE_DISPATCHER=false for sync deployment with another provider."
+        fi
+        if [ -n "${DISPATCHER_SOURCE:-}" ] && [ ! -f "${DISPATCHER_SOURCE}/charts/llm-d-async/Chart.yaml" ]; then
+            die "DISPATCHER_SOURCE must contain charts/llm-d-async/Chart.yaml. Fix the checkout path or set ENABLE_DISPATCHER=false for sync deployment."
+        fi
+    fi
     local missing=()
-    for cmd in kubectl helm kind make; do
+    local required=(kubectl helm kind make)
+    if [ "${ENABLE_DISPATCHER}" = "true" ]; then
+        required+=(jq nc docker)
+    fi
+    for cmd in "${required[@]}"; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [ ${#missing[@]} -gt 0 ]; then
-        die "Missing required tools: ${missing[*]}. Please install them first."
+        die "Missing required tools: ${missing[*]}. Please install them first. Async dev additionally checks jq, nc, and docker; opt out with ENABLE_DISPATCHER=false for sync."
     fi
     CONTAINER_TOOL="$(detect_container_tool)"
+    if [ "${ENABLE_DISPATCHER}" = "true" ] && [ "${CONTAINER_TOOL}" != "docker" ]; then
+        die "Async dev image loading requires running Docker. Start Docker or set ENABLE_DISPATCHER=false for sync deployment."
+    fi
     log "Container tool : ${CONTAINER_TOOL}"
     log "OS / Arch      : ${OS} / ${ARCH}"
 }
@@ -143,8 +175,8 @@ nodes:
   - containerPort: ${GRAFANA_NODE_PORT}
     hostPort: ${GRAFANA_PORT}
     protocol: TCP
-  - containerPort: ${MINIO_NODE_PORT}
-    hostPort: ${MINIO_PORT}
+  - containerPort: ${SEAWEEDFS_NODE_PORT}
+    hostPort: ${S3_STORAGE_HOST_PORT}
     protocol: TCP
   - containerPort: ${REDIS_NODE_PORT:-30479}
     hostPort: ${REDIS_PORT:-6399}
@@ -372,13 +404,13 @@ EOF
     log "PVC '${FILES_PVC_NAME}' created."
 }
 
-# ── MinIO (S3-compatible object storage) ─────────────────────────────────────
+# ── SeaweedFS (S3-compatible object storage) ──────────────────────────────────
 
-install_minio() {
-    step "Installing MinIO '${MINIO_NAME}'..."
+install_seaweedfs() {
+    step "Installing SeaweedFS '${SEAWEEDFS_NAME}'..."
 
-    if kubectl get deployment "${MINIO_NAME}" -n "${NAMESPACE}" &>/dev/null; then
-        log "MinIO '${MINIO_NAME}' already exists. Skipping."
+    if kubectl get deployment "${SEAWEEDFS_NAME}" -n "${NAMESPACE}" &>/dev/null; then
+        log "SeaweedFS '${SEAWEEDFS_NAME}' already exists. Skipping."
         return
     fi
 
@@ -386,60 +418,57 @@ install_minio() {
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ${MINIO_NAME}
+  name: ${SEAWEEDFS_NAME}
   namespace: ${NAMESPACE}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: ${MINIO_NAME}
+      app: ${SEAWEEDFS_NAME}
   template:
     metadata:
       labels:
-        app: ${MINIO_NAME}
+        app: ${SEAWEEDFS_NAME}
     spec:
       containers:
-      - name: minio
-        image: ${MINIO_IMAGE}
-        args: ["server", "/data", "--console-address", ":9001"]
+      - name: seaweedfs
+        image: ${SEAWEEDFS_IMAGE}
+        # -admin.port: mini still allocates the admin port (gRPC = port+10000) even with -admin.ui=false;
+        # the default 23646/33646 can collide with the Linux ephemeral port range.
+        args: ["mini", "-dir=/data", "-s3.port=${SEAWEEDFS_S3_PORT}", "-webdav=false", "-admin.ui=false", "-admin.port=12646", "-s3.port.iceberg=0", "-s3.port.lance=0"]
         env:
-        - name: MINIO_ROOT_USER
-          value: "${MINIO_ACCESS_KEY}"
-        - name: MINIO_ROOT_PASSWORD
-          value: "${MINIO_SECRET_KEY}"
+        - name: AWS_ACCESS_KEY_ID
+          value: "${S3_ACCESS_KEY}"
+        - name: AWS_SECRET_ACCESS_KEY
+          value: "${S3_SECRET_ACCESS_KEY}"
         ports:
-        - containerPort: 9000
-          name: api
-        - containerPort: 9001
-          name: console
+        - containerPort: ${SEAWEEDFS_S3_PORT}
+          name: s3
         readinessProbe:
           httpGet:
-            path: /minio/health/ready
-            port: 9000
+            path: /healthz
+            port: s3
           initialDelaySeconds: 5
           periodSeconds: 5
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: ${MINIO_NAME}
+  name: ${SEAWEEDFS_NAME}
   namespace: ${NAMESPACE}
 spec:
   selector:
-    app: ${MINIO_NAME}
+    app: ${SEAWEEDFS_NAME}
   ports:
-  - name: api
-    port: 9000
-    targetPort: 9000
-  - name: console
-    port: 9001
-    targetPort: 9001
+  - name: s3
+    port: ${SEAWEEDFS_S3_PORT}
+    targetPort: ${SEAWEEDFS_S3_PORT}
 EOF
 
-    log "Waiting for MinIO to be ready..."
-    kubectl rollout status deployment "${MINIO_NAME}" -n "${NAMESPACE}" --timeout=120s
+    log "Waiting for SeaweedFS to be ready..."
+    kubectl rollout status deployment "${SEAWEEDFS_NAME}" -n "${NAMESPACE}" --timeout=120s
 
-    log "MinIO installed."
+    log "SeaweedFS installed."
 }
 
 # ── Jaeger (OpenTelemetry collector & trace UI) ──────────────────────────────
@@ -1087,18 +1116,6 @@ install_batch_gateway() {
         --set "processor.image.tag=${IMAGE_TAG}"
         --set "global.fileClient.type=${FILE_CLIENT_TYPE}"
         --set "global.secretName=${APP_SECRET_NAME}"
-        --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.url=${vllm_sim_url}"
-        --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.requestTimeout=5m"
-        --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.maxRetries=3"
-        --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.initialBackoff=1s"
-        --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.maxBackoff=60s"
-        --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.url=${vllm_sim_b_url}"
-        --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.requestTimeout=5m"
-        --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.maxRetries=3"
-        --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.initialBackoff=1s"
-        --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.maxBackoff=60s"
-        --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.inferenceObjective=${GIE_OBJECTIVE_PREFIX}"
-        --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.inferenceObjective=${GIE_OBJECTIVE_PREFIX}"
         --set "processor.logging.verbosity=${LOG_VERBOSITY}"
         --set "apiserver.logging.verbosity=${LOG_VERBOSITY}"
         --set "apiserver.config.batchAPI.passThroughHeaders={X-E2E-Pass-Through-1,X-E2E-Pass-Through-2}"
@@ -1122,14 +1139,35 @@ install_batch_gateway() {
         --namespace "${NAMESPACE}"
     )
 
+    if [ "${ENABLE_DISPATCHER}" = "true" ]; then
+        helm_args+=(--values "${REPO_ROOT}/test/e2e/dispatcher/processor-async-values.yaml")
+    else
+        helm_args+=(
+            --set processor.config.dispatchMode=sync
+            --set processor.config.asyncDispatch=null
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.url=${vllm_sim_url}"
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.requestTimeout=5m"
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.maxRetries=3"
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.initialBackoff=1s"
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.maxBackoff=60s"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.url=${vllm_sim_b_url}"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.requestTimeout=5m"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.maxRetries=3"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.initialBackoff=1s"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.maxBackoff=60s"
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.inferenceObjective=${GIE_OBJECTIVE_PREFIX}"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.inferenceObjective=${GIE_OBJECTIVE_PREFIX}"
+        )
+    fi
+
     # Add file client specific helm args
     if [ "${FILE_CLIENT_TYPE}" = "s3" ]; then
-        local minio_endpoint="http://${MINIO_NAME}.${NAMESPACE}.svc.cluster.local:9000"
+        local s3_endpoint="http://${SEAWEEDFS_NAME}.${NAMESPACE}.svc.cluster.local:${SEAWEEDFS_S3_PORT}"
         helm_args+=(
-            --set "global.fileClient.s3.region=${MINIO_REGION}"
-            --set "global.fileClient.s3.bucket=${MINIO_BUCKET}"
-            --set "global.fileClient.s3.endpoint=${minio_endpoint}"
-            --set "global.fileClient.s3.accessKeyId=${MINIO_ACCESS_KEY}"
+            --set "global.fileClient.s3.region=${S3_REGION}"
+            --set "global.fileClient.s3.bucket=${S3_BUCKET}"
+            --set "global.fileClient.s3.endpoint=${s3_endpoint}"
+            --set "global.fileClient.s3.accessKeyId=${S3_ACCESS_KEY}"
             --set "global.fileClient.s3.usePathStyle=true"
             --set "global.fileClient.s3.autoCreateBucket=true"
         )
@@ -1153,7 +1191,7 @@ install_batch_gateway() {
 
     if helm status "${HELM_RELEASE}" -n "${NAMESPACE}" &>/dev/null; then
         log "Release '${HELM_RELEASE}' already exists. Upgrading..."
-        helm upgrade "${HELM_RELEASE}" ./charts/batch-gateway "${helm_args[@]}"
+        helm upgrade "${HELM_RELEASE}" ./charts/batch-gateway --reset-values "${helm_args[@]}"
         # Force pod restart so the newly-loaded container images are picked up.
         # helm upgrade alone won't recreate pods when only the image contents
         # changed but the tag (e.g. 0.0.1) stayed the same.
@@ -1327,17 +1365,17 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: ${MINIO_NAME}-nodeport
+  name: ${SEAWEEDFS_NAME}-nodeport
 spec:
   type: NodePort
   selector:
-    app: ${MINIO_NAME}
+    app: ${SEAWEEDFS_NAME}
   ports:
-  - name: api
+  - name: s3
     protocol: TCP
-    port: 9000
-    targetPort: 9000
-    nodePort: ${MINIO_NODE_PORT}
+    port: ${SEAWEEDFS_S3_PORT}
+    targetPort: ${SEAWEEDFS_S3_PORT}
+    nodePort: ${SEAWEEDFS_NODE_PORT}
 ---
 apiVersion: v1
 kind: Service
@@ -1398,6 +1436,10 @@ print_usage() {
     echo "     Async dispatcher is enabled:"
     echo "       - Processor is configured for async dispatch via llm-d-async"
     echo "       - Run dispatcher tests: ENABLE_DISPATCHER=true make test-e2e"
+    else
+    echo ""
+    echo "     Sync dispatch is enabled (default)."
+    echo "       - Deploy async fixtures with: ENABLE_DISPATCHER=true make dev-deploy"
     fi
     echo ""
     echo "  3. Create a batch (replace FILE_ID with the id from step 2):"
@@ -1474,9 +1516,9 @@ main() {
     install_postgresql
     create_secret
     create_tls_secret
-    # MinIO is always installed so that S3 integration tests can run
+    # SeaweedFS is always installed so that S3 integration tests can run
     # against the dev cluster regardless of the batch file client type.
-    install_minio
+    install_seaweedfs
     if [ "${FILE_CLIENT_TYPE}" != "s3" ]; then
         create_pvc
     fi
@@ -1497,17 +1539,19 @@ main() {
             log "Cleaned up cloned GIE repo at ${GIE_REPO_TMPDIR}"
         fi
     fi
+    if [ "${ENABLE_DISPATCHER}" = "true" ]; then
+        source "${SCRIPT_DIR}/dev-deploy-dispatcher.sh"
+    fi
     install_batch_gateway
     verify_deployment
     if [ "${USE_KIND}" = true ]; then
         create_nodeport_services
-    fi
-    if [ "${ENABLE_DISPATCHER}" = "true" ]; then
-        source "${SCRIPT_DIR}/dev-deploy-dispatcher.sh"
     fi
     print_usage
 
     log "Deployment complete!"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

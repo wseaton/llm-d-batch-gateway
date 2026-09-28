@@ -1,7 +1,15 @@
 # Worker Settings - task wait time needs to be shorter than poll interval
 task_wait_time: "1s"
 poll_interval: "5s"
-num_workers: 20
+num_workers: 5
+# Maximum capacity of the work_dir. In Kubernetes, keep this equal to
+# processor.workDirVolume.sizeLimit in the Helm values.
+work_dir_size_limit: "10Gi"
+# Percentage of work_dir reserved for concurrently staged input files. The
+# processor reduces num_workers at startup when this budget is smaller.
+input_file_disk_budget_percent: 10
+# Must match file_api.max_size_bytes in the API server configuration.
+input_file_max_size_bytes: 209715200
 queue_time_bucket:
   start: 0.1
   factor: 2
@@ -39,6 +47,7 @@ work_dir: "/var/lib/batch-gateway/processor"
 
 # Inference gateway configuration.
 # Either global_inference_gateway or model_gateways must be configured.
+dispatch_mode: sync
 #
 # Option 1: global_inference_gateway routes ALL requests to one endpoint.
 # Use for MaaS / multi-model platforms or LoRA-only deployments

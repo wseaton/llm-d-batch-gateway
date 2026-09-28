@@ -1,6 +1,5 @@
 ap:
   imagePullPolicy: Never
-  messageQueueImpl: "redis-sortedset"
   concurrency: 1
   prometheusURL: "http://prometheus.default.svc.cluster.local:9090"
   prometheusCacheTTL: "0s"
@@ -14,12 +13,13 @@ ap:
     enabled: true
     port: 9092
     secure: false
-  redis:
-    enabled: true
-    url: "redis://redis-master.default.svc.cluster.local:6379"
-    pollIntervalMs: 500
-    batchSize: 10
-    queuesConfig:
+  transport: "redis-sortedset"
+  transportConfig:
+    urlSecret:
+      url: "redis://redis-master.default.svc.cluster.local:6379"
+    poll_interval_ms: 500
+    batch_size: 10
+    queues:
       - queue_name: "llm-d-async:requests:sim-pool-prom"
         request_path_url: "/v1/completions"
         igw_base_url: "http://vllm-sim.default.svc.cluster.local:8000"

@@ -31,6 +31,7 @@ import (
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/batch_utils"
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/clientset"
+	"github.com/llm-d/llm-d-batch-gateway/internal/util/failpoint"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/logging"
 	uotel "github.com/llm-d/llm-d-batch-gateway/internal/util/otel"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/semaphore"
@@ -157,17 +158,21 @@ func (p *Processor) initConcurrencyControls(logger logr.Logger, stopAccepting co
 			stopAccepting()
 		}
 	}
-	var err error
-	p.tokens, err = semaphore.New(p.cfg.NumWorkers, makeGuard("num-workers"))
+	effectiveWorkers, err := p.cfg.EffectiveNumWorkers()
 	if err != nil {
-		return fmt.Errorf("worker semaphore (NumWorkers=%d): %w", p.cfg.NumWorkers, err)
+		return fmt.Errorf("calculate effective worker limit: %w", err)
+	}
+	p.tokens, err = semaphore.New(effectiveWorkers, makeGuard("num-workers"))
+	if err != nil {
+		return fmt.Errorf("worker semaphore (effective workers=%d): %w", effectiveWorkers, err)
 	}
 
 	if p.asyncInference != nil {
 		logger.V(logging.INFO).Info(
 			"Processor run started (async dispatch)",
 			"loopInterval", p.cfg.PollInterval,
-			"maxWorkers", p.cfg.NumWorkers,
+			"configuredWorkers", p.cfg.NumWorkers,
+			"effectiveWorkers", effectiveWorkers,
 		)
 		return nil
 	}
@@ -215,7 +220,8 @@ func (p *Processor) initConcurrencyControls(logger logr.Logger, stopAccepting co
 	logger.V(logging.INFO).Info(
 		"Processor run started",
 		"loopInterval", p.cfg.PollInterval,
-		"maxWorkers", p.cfg.NumWorkers,
+		"configuredWorkers", p.cfg.NumWorkers,
+		"effectiveWorkers", effectiveWorkers,
 		"concurrency.global", cc.Global,
 		"concurrency.per_endpoint", cc.PerEndpoint,
 		"concurrency.aimd.enabled", cc.AIMD.Enabled,
@@ -268,6 +274,8 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 			}
 			continue
 		}
+
+		failpoint.Inject("processor/after-dequeue")
 
 		// Pre-launch: use pollingCtx so guard cancel / SIGTERM interrupts
 		// DB fetch and validation promptly. jobBaseCtx is only used once
