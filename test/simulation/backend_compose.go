@@ -143,6 +143,11 @@ func (b *composeBackend) kill(service string) {
 	b.compose("kill", "-s", "SIGKILL", service)
 }
 
+func (b *composeBackend) execSQL(stmt string) {
+	b.t.Helper()
+	b.compose("exec", "-T", "postgres", "psql", "-U", "sim", "-d", "batchgw", "-v", "ON_ERROR_STOP=1", "-c", stmt)
+}
+
 func (b *composeBackend) toxiproxyAddr() (string, bool) { return "http://127.0.0.1:18474", true }
 
 func (b *composeBackend) restartsOnExit() bool { return false }

@@ -62,6 +62,9 @@ type stackBackend interface {
 	// a network partition; unpause resumes it.
 	pause(service string)
 	unpause(service string)
+	// execSQL runs one statement against the batch database as a superuser,
+	// standing in for another component's write.
+	execSQL(stmt string)
 }
 
 // simParams are backend timing characteristics scenarios must scale to.

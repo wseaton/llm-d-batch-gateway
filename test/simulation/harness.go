@@ -127,6 +127,12 @@ func (h *harness) unpause(service string) {
 	h.b.unpause(service)
 }
 
+func (h *harness) execSQL(stmt string) {
+	h.t.Helper()
+	h.rec.event("sql", map[string]any{"stmt": stmt})
+	h.b.execSQL(stmt)
+}
+
 func (h *harness) waitAPIReady() {
 	h.t.Helper()
 	deadline := time.Now().Add(readyTimeout)

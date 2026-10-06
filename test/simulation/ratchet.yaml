@@ -20,3 +20,5 @@ scenarios:
   cancel_racing_completion: fixed
   zombie_owner_burns_inference: broken
   replicas_execute_once: fixed
+  quiet_interval_cancel_lost: broken
+  quiet_interval_reclaim: broken

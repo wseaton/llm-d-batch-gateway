@@ -268,6 +268,14 @@ func (b *kindBackend) healthy(service string) bool {
 	return true
 }
 
+func (b *kindBackend) execSQL(stmt string) {
+	b.t.Helper()
+	if out, err := b.kubectl("exec", "statefulset/postgresql", "--", "env", "PGPASSWORD=postgres",
+		"psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", stmt); err != nil {
+		b.t.Fatalf("exec sql: %v\n%s", err, out)
+	}
+}
+
 func (b *kindBackend) toxiproxyAddr() (string, bool)  { return "", false }
 func (b *kindBackend) inferenceRequests() (int, bool) { return 0, false }
 
