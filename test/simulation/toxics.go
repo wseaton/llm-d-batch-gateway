@@ -26,13 +26,11 @@ import (
 // toxic partitions exactly one edge of the topology.
 const (
 	proxyAPIServerPostgres = "apiserver-postgres"
-	proxyAPIServerRedis    = "apiserver-redis"
 	proxyAPIServerS3       = "apiserver-s3"
 	proxyProcessorPostgres = "processor-postgres"
 	proxyProcessorRedis    = "processor-redis"
 	proxyProcessorS3       = "processor-s3"
 	proxyGCPostgres        = "gc-postgres"
-	proxyGCRedis           = "gc-redis"
 	proxyGCS3              = "gc-s3"
 )
 

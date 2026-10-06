@@ -240,8 +240,8 @@ func TestCancelReverted(t *testing.T) {
 }
 
 // TestCancelEventLost reproduces this failure: for an in-flight batch the
-// apiserver writes cancelling to the DB and then sends the cancel event to
-// Redis as a separate step. The apiserver dies between the two; the worker
+// apiserver writes cancelling to the DB and then inserts the cancel event
+// as a separate step. The apiserver dies between the two; the worker
 // never learns of the cancel, finishes the job, and its blind write moves
 // the batch cancelling -> completed.
 //

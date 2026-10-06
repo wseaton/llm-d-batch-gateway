@@ -27,5 +27,4 @@ file_client:
     auto_create_bucket: true
 
 otel:
-  redis_tracing: true
   postgresql_tracing: true

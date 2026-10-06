@@ -2,7 +2,7 @@
 
 Executable reproductions of the cross-store consistency bugs cataloged in
 [docs/design/consistency-harness.md](../../docs/design/consistency-harness.md).
-Real Postgres, Redis, and SeaweedFS; real gateway binaries built with the
+Real Postgres and SeaweedFS (plus Redis for the async topology); real gateway binaries built with the
 `failpoints` tag; inference served by
 [vllm-vcr](https://github.com/neuralmagic/vllm-vcr) (real vLLM Rust frontend,
 simulated engine-core, no GPU).
@@ -39,9 +39,9 @@ flowchart LR
     runner -.->|"request-log witness"| vcr
     runner -.->|"trace harvest :13200"| tempo
 
-    apiserver -->|"25432 · 26379 · 29000"| tox
+    apiserver -->|"25432 · 29000"| tox
     processor -->|"35432 · 36379 · 39000"| tox
-    gc -->|"45432 · 46379 · 49000"| tox
+    gc -->|"45432 · 49000"| tox
     tox --> postgres
     tox --> redis
     tox --> seaweedfs
@@ -52,8 +52,8 @@ flowchart LR
 Solid edges are the data path; dashed edges are how the runner injects faults
 and collects evidence. Each component reaches every store through its own
 toxiproxy listeners (ports above), which is what lets a scenario cut exactly
-one edge, e.g. blackhole apiserver↔redis responses while the processor's
-redis connection stays healthy. In host-vcr fallback mode the `vcr` box is
+one edge, e.g. blackhole apiserver↔postgres responses while the processor's
+postgres connection stays healthy. In host-vcr fallback mode the `vcr` box is
 two host processes instead of a container; everything else is identical.
 
 ## Prerequisites
@@ -87,7 +87,7 @@ The harness runs against one of two stacks, selected with `SIM_BACKEND`:
   `make sim-kind-deploy` (add `ENABLE_GIE=true` for the EPP; add
   `IMAGE_BUILD_EXTRA_ARGS=--load` when docker uses a buildx container
   driver, or the built images never reach the local store), then run with
-  `SIM_BACKEND=kind`. Scenarios reset Redis/Postgres/bucket state between
+  `SIM_BACKEND=kind`. Scenarios reset Postgres/bucket state (and Redis, when deployed) between
   runs but reuse the cluster. The reconciler runs at 30s there (vs 5s in
   compose); scenarios scale their timing from `params()`.
 
@@ -114,7 +114,7 @@ drives the API, lets recovery mechanisms run at compressed intervals
 Every gateway-component store connection is routed through
 [toxiproxy](https://github.com/Shopify/toxiproxy) on a per-component-per-store
 proxy (`config/toxiproxy.json`), so a scenario can partition exactly one edge:
-cut apiserver↔redis while the processor's redis connection stays healthy.
+cut apiserver↔postgres while the processor's postgres connection stays healthy.
 Scenarios apply and remove toxics through the control API on host port 18474
 (`toxics.go`); harness cleanup heals all proxies so a failed scenario cannot
 poison the next. Any scenario needing the vcr request-log witness skips on

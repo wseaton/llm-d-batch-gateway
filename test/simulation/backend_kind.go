@@ -213,16 +213,18 @@ func (b *kindBackend) disarmAll() {
 	}
 }
 
-// resetState wipes batch state between scenarios: Redis (queue, in-flight,
-// events, progress), Postgres records, and the object bucket.
+// resetState wipes batch state between scenarios: Redis (async queues, when
+// deployed), Postgres records and events, and the object bucket.
 func (b *kindBackend) resetState() {
 	b.t.Helper()
-	if out, err := b.kubectl("exec", "statefulset/redis-master", "--", "redis-cli", "flushall"); err != nil {
-		b.t.Fatalf("flush redis: %v\n%s", err, out)
+	if _, err := b.kubectl("get", "statefulset/redis-master"); err == nil {
+		if out, err := b.kubectl("exec", "statefulset/redis-master", "--", "redis-cli", "flushall"); err != nil {
+			b.t.Fatalf("flush redis: %v\n%s", err, out)
+		}
 	}
 	// The tables may not exist before the first component boot; tolerate that.
 	if out, err := b.kubectl("exec", "statefulset/postgresql", "--", "env", "PGPASSWORD=postgres",
-		"psql", "-U", "postgres", "-c", "TRUNCATE TABLE batch_items, file_items"); err != nil {
+		"psql", "-U", "postgres", "-c", "TRUNCATE TABLE batch_items, file_items, batch_events"); err != nil {
 		b.t.Logf("truncate postgres (tolerated on first run): %v\n%s", err, out)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

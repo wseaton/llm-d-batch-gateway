@@ -29,7 +29,7 @@ async_dispatch:
       inference_pool_name: "sim-pool"
 
 default_output_expiration_seconds: 3600
-progress_ttl_seconds: 600
+progress_update_interval: "2s"
 
 db_client:
   type: "postgresql"
@@ -45,5 +45,4 @@ file_client:
     auto_create_bucket: true
 
 otel:
-  redis_tracing: true
   postgresql_tracing: true
