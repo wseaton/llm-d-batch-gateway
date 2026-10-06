@@ -119,7 +119,7 @@ func (c *PostgresFileDBClient) DBUpdate(ctx context.Context, item *api.FileItem,
 		err = fmt.Errorf("item is nil")
 		return
 	}
-	if err = c.update(ctx, &item.BaseIndexes, &item.BaseContents, expectedStatus, nil, nil); err != nil {
+	if err = c.update(ctx, &item.BaseIndexes, &item.BaseContents, expectedStatus, nil, nil, nil); err != nil {
 		return
 	}
 	return
