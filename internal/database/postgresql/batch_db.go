@@ -171,7 +171,11 @@ func (c *PostgresBatchDBClient) DBUpdate(ctx context.Context, item *api.BatchIte
 	if item.BumpEpoch {
 		rawSets = append(rawSets, colEpoch+" = "+colEpoch+" + 1")
 	}
-	if err = c.update(ctx, &item.BaseIndexes, &item.BaseContents, expectedStatus, epochFence, rawSets); err != nil {
+	statusIn := make([]string, len(item.ExpectedStatuses))
+	for i, s := range item.ExpectedStatuses {
+		statusIn[i] = string(s)
+	}
+	if err = c.update(ctx, &item.BaseIndexes, &item.BaseContents, expectedStatus, statusIn, epochFence, rawSets); err != nil {
 		return
 	}
 	return

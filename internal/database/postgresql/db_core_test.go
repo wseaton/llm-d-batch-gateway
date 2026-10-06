@@ -295,7 +295,7 @@ func TestCoreUpdate_ValidationError(t *testing.T) {
 	idx := &api.BaseIndexes{ID: "", TenantID: "t1"}
 	contents := &api.BaseContents{Status: []byte(`{}`)}
 
-	if err := core.update(context.Background(), idx, contents, nil, nil, nil); err == nil {
+	if err := core.update(context.Background(), idx, contents, nil, nil, nil, nil); err == nil {
 		t.Fatal("expected validation error for empty ID")
 	}
 }
@@ -311,7 +311,7 @@ func TestCoreUpdate_NonExistentID(t *testing.T) {
 		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), "missing").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 
-	if err := core.update(context.Background(), idx, contents, nil, nil, nil); err == nil {
+	if err := core.update(context.Background(), idx, contents, nil, nil, nil, nil); err == nil {
 		t.Fatal("expected error for non-existent ID")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -326,7 +326,7 @@ func TestCoreUpdate_NoFieldsToUpdate(t *testing.T) {
 	idx := &api.BaseIndexes{ID: "id-1", TenantID: "t1", Tags: nil}
 	contents := &api.BaseContents{}
 
-	if err := core.update(context.Background(), idx, contents, nil, nil, nil); err != nil {
+	if err := core.update(context.Background(), idx, contents, nil, nil, nil, nil); err != nil {
 		t.Fatalf("expected nil for no-op update, got %v", err)
 	}
 }
@@ -342,7 +342,7 @@ func TestCoreUpdate_DBFailure(t *testing.T) {
 		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), "id-1").
 		WillReturnError(fmt.Errorf("connection refused"))
 
-	if err := core.update(context.Background(), idx, contents, nil, nil, nil); err == nil {
+	if err := core.update(context.Background(), idx, contents, nil, nil, nil, nil); err == nil {
 		t.Fatal("expected error on DB failure")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

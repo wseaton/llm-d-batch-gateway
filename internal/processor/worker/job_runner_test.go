@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -780,5 +783,210 @@ func TestHandleJobError_Shutdown_LeavesJobInProgress(t *testing.T) {
 	}
 	if got.Status != openai.BatchStatusInProgress {
 		t.Fatalf("status = %s, want in_progress (left for reconciler)", got.Status)
+	}
+}
+
+// rowChangeDB changes the stored row the first time the processor writes
+// onWrite, just before that write reaches the database.
+type rowChangeDB struct {
+	db.BatchProgressDBClient
+	onWrite openai.BatchStatus
+	change  func(*db.BatchItem)
+	once    sync.Once
+}
+
+func (d *rowChangeDB) DBUpdate(ctx context.Context, item *db.BatchItem, expectedStatus []byte) error {
+	var st openai.BatchStatusInfo
+	if err := json.Unmarshal(item.Status, &st); err == nil && st.Status == d.onWrite {
+		var changeErr error
+		d.once.Do(func() {
+			items, _, _, err := d.DBGet(ctx, &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{item.ID}}}, true, 0, 1)
+			if err != nil || len(items) != 1 {
+				changeErr = fmt.Errorf("rowChangeDB: read row: err=%v len=%d", err, len(items))
+				return
+			}
+			d.change(items[0])
+			changeErr = d.DBStore(ctx, items[0])
+		})
+		if changeErr != nil {
+			return changeErr
+		}
+	}
+	return d.BatchProgressDBClient.DBUpdate(ctx, item, expectedStatus)
+}
+
+// TestRunJob_StatusConflict runs a job whose row changes underneath a status
+// write while no cancel event is delivered.
+func TestRunJob_StatusConflict(t *testing.T) {
+	const (
+		jobID       = "job-status-conflict"
+		tenantID    = "tenant-1"
+		inputFileID = "file-input-conflict"
+		epoch       = int64(2)
+	)
+	setStatus := func(t *testing.T, status openai.BatchStatus) func(*db.BatchItem) {
+		return func(item *db.BatchItem) {
+			var info openai.BatchStatusInfo
+			if err := json.Unmarshal(item.Status, &info); err != nil {
+				t.Errorf("unmarshal row status: %v", err)
+				return
+			}
+			info.Status = status
+			item.Status = mustJSON(t, info)
+		}
+	}
+	bumpEpoch := func(item *db.BatchItem) { item.Epoch++ }
+
+	tests := []struct {
+		name          string
+		onWrite       openai.BatchStatus
+		change        func(t *testing.T) func(*db.BatchItem)
+		wantStatus    openai.BatchStatus
+		wantEpoch     int64
+		wantInference int32
+		// wantWrites is the exact count of each terminal status the processor wrote.
+		wantWrites map[openai.BatchStatus]int
+	}{
+		{
+			name:          "cancelled during ingestion finalizes as cancelled without inference",
+			onWrite:       openai.BatchStatusInProgress,
+			change:        func(t *testing.T) func(*db.BatchItem) { return setStatus(t, openai.BatchStatusCancelling) },
+			wantStatus:    openai.BatchStatusCancelled,
+			wantEpoch:     epoch,
+			wantInference: 0,
+			wantWrites:    map[openai.BatchStatus]int{openai.BatchStatusCancelled: 1},
+		},
+		{
+			name:          "reclaimed during ingestion stops without a terminal write",
+			onWrite:       openai.BatchStatusInProgress,
+			change:        func(*testing.T) func(*db.BatchItem) { return bumpEpoch },
+			wantStatus:    openai.BatchStatusValidating,
+			wantEpoch:     epoch + 1,
+			wantInference: 0,
+		},
+		{
+			name:          "cancelled after the last progress tick finalizes as cancelled",
+			onWrite:       openai.BatchStatusFinalizing,
+			change:        func(t *testing.T) func(*db.BatchItem) { return setStatus(t, openai.BatchStatusCancelling) },
+			wantStatus:    openai.BatchStatusCancelled,
+			wantEpoch:     epoch,
+			wantInference: 1,
+			wantWrites:    map[openai.BatchStatus]int{openai.BatchStatusCancelled: 1},
+		},
+		{
+			name:          "reclaimed before finalization stops without a terminal write",
+			onWrite:       openai.BatchStatusFinalizing,
+			change:        func(*testing.T) func(*db.BatchItem) { return bumpEpoch },
+			wantStatus:    openai.BatchStatusInProgress,
+			wantEpoch:     epoch + 1,
+			wantInference: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := testLoggerCtx(t)
+			cfg := config.NewConfig()
+			cfg.WorkDir = t.TempDir()
+			filesRoot := t.TempDir()
+
+			folderName, err := ucom.GetFolderNameByTenantID(tenantID)
+			if err != nil {
+				t.Fatalf("GetFolderNameByTenantID: %v", err)
+			}
+			storageDir := filepath.Join(filesRoot, folderName)
+			if err := os.MkdirAll(storageDir, 0o755); err != nil {
+				t.Fatalf("MkdirAll storage dir: %v", err)
+			}
+			inputContent := `{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"test-model","messages":[{"role":"user","content":"hello"}]}}` + "\n"
+			if err := os.WriteFile(filepath.Join(storageDir, ucom.FileStorageName(inputFileID, "input.jsonl")), []byte(inputContent), 0o644); err != nil {
+				t.Fatalf("WriteFile input: %v", err)
+			}
+			fileDBClient := newMockFileDBClient()
+			fileItem, err := converter.FileToDBItem(&openai.FileObject{
+				ID:       inputFileID,
+				Filename: "input.jsonl",
+				Purpose:  openai.FileObjectPurposeBatch,
+				Object:   "file",
+			}, tenantID, db.Tags{})
+			if err != nil {
+				t.Fatalf("FileToDBItem: %v", err)
+			}
+			if err := fileDBClient.DBStore(ctx, fileItem); err != nil {
+				t.Fatalf("DBStore file item: %v", err)
+			}
+
+			jobItem := &db.BatchItem{
+				BaseIndexes:  db.BaseIndexes{ID: jobID, TenantID: tenantID},
+				BaseContents: db.BaseContents{Status: mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusValidating})},
+				Epoch:        epoch,
+			}
+			inner := newMockBatchDBClient()
+			if err := inner.DBStore(ctx, &db.BatchItem{
+				BaseIndexes:  jobItem.BaseIndexes,
+				BaseContents: jobItem.BaseContents,
+				Epoch:        epoch,
+			}); err != nil {
+				t.Fatalf("DBStore batch item: %v", err)
+			}
+			spy := newSpyBatchDB(&rowChangeDB{BatchProgressDBClient: inner, onWrite: tt.onWrite, change: tt.change(t)})
+
+			var inferred atomic.Int32
+			p := mustNewProcessor(t, cfg, &clientset.Clientset{
+				BatchDB: spy,
+				FileDB:  fileDBClient,
+				File:    mockfiles.NewMockBatchFilesClient(filesRoot),
+				Event:   mockdb.NewMockBatchEventChannelClient(),
+				Queue:   mockdb.NewMockBatchPriorityQueueClient(),
+				Inference: inference.NewSingleClientResolver(&mockInferenceClient{
+					generateFn: func(context.Context, *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+						inferred.Add(1)
+						return &inference.GenerateResponse{RequestID: "server-req-1", Response: []byte(`{"choices":[]}`)}, nil
+					},
+				}),
+			})
+
+			if !p.acquire(context.Background()) {
+				t.Fatalf("expected token acquire before runJob")
+			}
+			p.wg.Add(1)
+			p.runJob(ctx, &jobExecutionParams{
+				updater: NewStatusUpdater(spy),
+				jobItem: jobItem,
+				jobInfo: &batch_types.JobInfo{
+					JobID:    jobID,
+					TenantID: tenantID,
+					BatchJob: &openai.Batch{
+						ID: jobID,
+						BatchSpec: openai.BatchSpec{
+							InputFileID: inputFileID,
+							Endpoint:    "/v1/chat/completions",
+						},
+						BatchStatusInfo: openai.BatchStatusInfo{Status: openai.BatchStatusValidating},
+					},
+				},
+				task: &db.BatchJobPriority{ID: jobID, SLO: time.Now().Add(time.Hour)},
+			})
+
+			assertJobStatus(t, inner, jobID, tt.wantStatus)
+			items, _, _, err := inner.DBGet(ctx, &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)
+			if err != nil || len(items) != 1 {
+				t.Fatalf("DBGet: err=%v len=%d", err, len(items))
+			}
+			if items[0].Epoch != tt.wantEpoch {
+				t.Fatalf("row epoch = %d, want %d", items[0].Epoch, tt.wantEpoch)
+			}
+			if got := inferred.Load(); got != tt.wantInference {
+				t.Fatalf("inference requests = %d, want %d", got, tt.wantInference)
+			}
+			for _, status := range []openai.BatchStatus{
+				openai.BatchStatusCompleted, openai.BatchStatusFailed,
+				openai.BatchStatusCancelled, openai.BatchStatusExpired,
+			} {
+				if got := spy.StatusCalls(status); got != tt.wantWrites[status] {
+					t.Errorf("%s writes = %d, want %d", status, got, tt.wantWrites[status])
+				}
+			}
+		})
 	}
 }

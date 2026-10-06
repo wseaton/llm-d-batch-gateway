@@ -16,6 +16,8 @@ limitations under the License.
 
 package api
 
+import "github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
+
 // BatchItem is the database item type
 type BatchItem struct {
 	BaseIndexes
@@ -39,6 +41,10 @@ type BatchItem struct {
 	// in addition to checking it. Set by the GC reconciler when reclaiming
 	// an orphan — this is an ownership change (like a Raft term bump).
 	BumpEpoch bool
+
+	// ExpectedStatuses, when non-empty, makes DBUpdate conditional on the
+	// row's lifecycle status (status.status) being one of these values.
+	ExpectedStatuses []openai.BatchStatus
 
 	// RecoveryAttempts counts startup recoveries under the current ownership.
 	// Reset on dequeue, incremented by PQClaimOwned.

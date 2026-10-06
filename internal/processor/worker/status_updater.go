@@ -141,7 +141,8 @@ func (s *StatusUpdater) UpdatePersistentStatus(
 		BaseContents: db.BaseContents{
 			Status: statusBytes,
 		},
-		Epoch: dbJob.Epoch,
+		Epoch:            dbJob.Epoch,
+		ExpectedStatuses: transitionSources(newStatus),
 	}, nil); err != nil {
 		return err
 	}
@@ -151,6 +152,29 @@ func (s *StatusUpdater) UpdatePersistentStatus(
 	logger := logr.FromContextOrDiscard(ctx)
 	logger.V(logging.INFO).Info("Batch status updated successfully", "newStatus", newStatus)
 	return nil
+}
+
+// transitionSources returns the lifecycle statuses the processor may move a
+// job out of into next. A row in any other status fails the write with
+// db.ErrConflict.
+func transitionSources(next openai.BatchStatus) []openai.BatchStatus {
+	switch next {
+	case openai.BatchStatusInProgress:
+		return []openai.BatchStatus{openai.BatchStatusValidating}
+	case openai.BatchStatusFinalizing:
+		return []openai.BatchStatus{openai.BatchStatusInProgress}
+	case openai.BatchStatusCompleted:
+		return []openai.BatchStatus{openai.BatchStatusFinalizing}
+	case openai.BatchStatusValidating:
+		return []openai.BatchStatus{openai.BatchStatusInProgress}
+	default:
+		return []openai.BatchStatus{
+			openai.BatchStatusValidating,
+			openai.BatchStatusInProgress,
+			openai.BatchStatusFinalizing,
+			openai.BatchStatusCancelling,
+		}
+	}
 }
 
 // withFileIDs returns a modifier that sets output and error file IDs on the status info.

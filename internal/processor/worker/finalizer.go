@@ -111,8 +111,19 @@ func (p *Processor) finalizeJob(
 	// in_progress → finalizing
 	// Written before file uploads so the API server can reject cancel requests once
 	// finalization has begun, narrowing the cancel-vs-complete race window.
+	cancelRequested := false
 	if err := updater.UpdatePersistentStatus(ioCtx, dbJob, openai.BatchStatusFinalizing, requestCounts, nil); err != nil {
-		return fmt.Errorf("failed to update job status to finalizing: %w", err)
+		if !errors.Is(err, db.ErrConflict) {
+			return fmt.Errorf("failed to update job status to finalizing: %w", err)
+		}
+		status, checkErr := updater.CheckJobStatus(ioCtx, dbJob.ID, dbJob.Epoch)
+		if checkErr != nil {
+			return fmt.Errorf("failed to update job status to finalizing: %w", checkErr)
+		}
+		if status != openai.BatchStatusCancelling {
+			return fmt.Errorf("failed to update job status to finalizing: job is %s", status)
+		}
+		cancelRequested = true
 	}
 
 	// Per the OpenAI batch spec, output_file_id and error_file_id are both optional:
@@ -156,10 +167,11 @@ func (p *Processor) finalizeJob(
 		return fmt.Errorf("upload failure during finalization: %w", errFinalizeFailedOver)
 	}
 
-	// Best-effort: honour a user cancel that arrived during finalization.
+	// Best-effort: honour a user cancel that arrived during finalization, either as
+	// the cancel event or as the cancelling status the finalizing write ran into.
 	// Only an explicit user cancel routes here — context.Cause is batchctx.ErrCancelled
 	// exclusively for user cancellation; SLO expiry and SIGTERM are other causes.
-	if errors.Is(context.Cause(ctx), batchctx.ErrCancelled) {
+	if cancelRequested || errors.Is(context.Cause(ctx), batchctx.ErrCancelled) {
 		logger.V(logging.INFO).Info("Cancel requested during finalization; finalizing as cancelled")
 		if err := updater.UpdateCancelledStatus(ioCtx, dbJob, requestCounts, outputFileID, errorFileID); err != nil {
 			logger.Error(err, "Failed to update cancelled status, falling back to failed with file IDs preserved")
