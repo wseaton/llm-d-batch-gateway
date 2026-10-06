@@ -47,6 +47,7 @@ func TestQuietIntervalCancelLost(t *testing.T) {
 		t.Fatal("batch never reached in_progress")
 	}
 	time.Sleep(5 * time.Second)
+	requireQuiet(t, client, batch.ID)
 	if _, err := client.cancelBatch(batch.ID); err == nil {
 		t.Fatal("cancel succeeded; expected the armed failpoint to kill the apiserver after the DB write")
 	}
@@ -120,6 +121,7 @@ func TestQuietIntervalReclaim(t *testing.T) {
 	time.Sleep(3 * time.Second)
 	startedBefore := h.inferenceWitness() - baseline
 	h.rec.event("witness", map[string]any{"phase": "before-reclaim", "started": startedBefore})
+	requireQuiet(t, client, batch.ID)
 
 	h.execSQL(fmt.Sprintf("UPDATE batch_items SET epoch = epoch + 1 WHERE id = '%s'", batch.ID))
 
@@ -134,4 +136,21 @@ func TestQuietIntervalReclaim(t *testing.T) {
 	detail := fmt.Sprintf("requests started: %d before the epoch bump, %d after (of %d lines); sequence %v",
 		startedBefore, startedAfter, lines, tl.statuses())
 	judge(t, scenario, reproduced, detail)
+}
+
+// requireQuiet fails the scenario unless the batch is still in progress with
+// no request finished, so a broken engine that fails requests fast cannot
+// pass for a quiet interval.
+func requireQuiet(t *testing.T, client *apiClient, batchID string) {
+	t.Helper()
+	b, err := client.getBatch(batchID)
+	if err != nil {
+		t.Fatalf("get batch: %v", err)
+	}
+	if b.Status != openai.BatchStatusInProgress {
+		t.Fatalf("batch is %s before the quiet-interval change; want in_progress", b.Status)
+	}
+	if c := b.RequestCounts; c.Completed+c.Failed > 0 {
+		t.Fatalf("%d completed and %d failed requests before the quiet-interval change; want none", c.Completed, c.Failed)
+	}
 }

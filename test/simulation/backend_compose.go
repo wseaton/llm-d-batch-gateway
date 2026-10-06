@@ -220,7 +220,7 @@ func (b *composeBackend) vcrImage() string {
 	if img := os.Getenv("VCR_IMAGE"); img != "" {
 		return img
 	}
-	return "ghcr.io/neuralmagic/vllm-vcr:dev"
+	return "ghcr.io/neuralmagic/vllm-vcr:0.2.2-vllm0.27"
 }
 
 func (b *composeBackend) composeArgs(args ...string) *exec.Cmd {
