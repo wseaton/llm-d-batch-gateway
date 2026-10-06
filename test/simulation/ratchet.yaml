@@ -22,3 +22,4 @@ scenarios:
   replicas_execute_once: fixed
   quiet_interval_cancel_lost: broken
   quiet_interval_reclaim: broken
+  cancel_before_finalizing: broken

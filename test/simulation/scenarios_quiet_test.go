@@ -154,3 +154,69 @@ func requireQuiet(t *testing.T, client *apiClient, batchID string) {
 		t.Fatalf("%d completed and %d failed requests before the quiet-interval change; want none", c.Completed, c.Failed)
 	}
 }
+
+// TestCancelBeforeFinalizing: every request has finished and the processor
+// is about to write finalizing when the apiserver writes cancelling and dies
+// before it inserts the cancel event. No progress tick is left to notice the
+// row, so only the finalizing write itself can.
+//
+// Invariant (legal transitions): cancelling may only lead to cancelled or
+// failed.
+func TestCancelBeforeFinalizing(t *testing.T) {
+	const scenario = "cancel_before_finalizing"
+	hold := 20 * time.Second
+	h := newHarness(t, map[string]string{
+		"APISERVER_FAILPOINTS": "apiserver/after-cancel-dbupdate=exit",
+		"PROCESSOR_FAILPOINTS": fmt.Sprintf("processor/before-finalizing-write=sleep(%d)", hold.Milliseconds()),
+	})
+	client := newAPIClient()
+	const lines = 2
+	fileID, err := client.uploadFile("cancel-before-finalizing.jsonl", inputJSONL(lines, 10))
+	if err != nil {
+		t.Fatalf("upload input file: %v", err)
+	}
+	batch, err := client.createBatch(fileID, "24h")
+	if err != nil {
+		t.Fatalf("create batch: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tl := observe(ctx, client, batch.ID, h.rec)
+
+	// The tracker's final push records every request before finalization.
+	for deadline := time.Now().Add(60 * time.Second); ; time.Sleep(250 * time.Millisecond) {
+		b, err := client.getBatch(batch.ID)
+		if err == nil && b.Status == openai.BatchStatusInProgress && b.RequestCounts.Completed == lines {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("batch never finished its requests while in_progress; last %+v (err %v)", b.BatchStatusInfo, err)
+		}
+	}
+	if _, err := client.cancelBatch(batch.ID); err == nil {
+		t.Fatal("cancel succeeded; expected the armed failpoint to kill the apiserver after the DB write")
+	}
+	h.rec.event("cancel-failed", map[string]any{"batch": batch.ID})
+
+	h.setEnv("APISERVER_FAILPOINTS", "")
+	h.restart("apiserver")
+
+	final, terminal := waitForStatus(client, batch.ID, hold+60*time.Second,
+		openai.BatchStatusCompleted, openai.BatchStatusCancelled, openai.BatchStatusFailed)
+	if !terminal {
+		t.Fatalf("batch never terminalized; last status %s", final.Status)
+	}
+	time.Sleep(1 * time.Second)
+	cancel()
+
+	var msgs []string
+	for _, v := range tl.checkTransitions() {
+		msgs = append(msgs, v.String())
+	}
+	reproduced := final.Status != openai.BatchStatusCancelled || len(msgs) > 0
+	detail := fmt.Sprintf("final %s; sequence %v", final.Status, tl.statuses())
+	if len(msgs) > 0 {
+		detail = strings.Join(msgs, "; ") + "; " + detail
+	}
+	judge(t, scenario, reproduced, detail)
+}

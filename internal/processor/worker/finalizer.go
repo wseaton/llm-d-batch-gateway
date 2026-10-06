@@ -111,6 +111,8 @@ func (p *Processor) finalizeJob(
 	defer ioCancel()
 	defer ioSpan.End()
 
+	failpoint.Inject("processor/before-finalizing-write")
+
 	// in_progress → finalizing
 	// Written before file uploads so the API server can reject cancel requests once
 	// finalization has begun, narrowing the cancel-vs-complete race window.
