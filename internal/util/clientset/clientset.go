@@ -29,7 +29,6 @@ import (
 	"github.com/go-logr/logr"
 	dbapi "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 	"github.com/llm-d/llm-d-batch-gateway/internal/database/postgresql"
-	dbRedis "github.com/llm-d/llm-d-batch-gateway/internal/database/redis"
 	fsapi "github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
 	fsclient "github.com/llm-d/llm-d-batch-gateway/internal/files_store/fs"
 	"github.com/llm-d/llm-d-batch-gateway/internal/files_store/retryclient"
@@ -37,20 +36,21 @@ import (
 	fstracing "github.com/llm-d/llm-d-batch-gateway/internal/files_store/tracing"
 	sharedcfg "github.com/llm-d/llm-d-batch-gateway/internal/shared/config"
 	ucom "github.com/llm-d/llm-d-batch-gateway/internal/util/com"
-	uredis "github.com/llm-d/llm-d-batch-gateway/internal/util/redis"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
 
 // Clientset holds all clients.
 type Clientset struct {
-	File           fsapi.BatchFilesClient
-	BatchDB        dbapi.BatchDBClient
-	FileDB         dbapi.FileDBClient
-	Queue          dbapi.BatchPriorityQueueClient
-	Event          dbapi.BatchEventChannelClient
-	Status         dbapi.BatchStatusClient
-	Inference      *inference.GatewayResolver
-	AsyncInference *inference.AsyncGatewayResolver
+	File            fsapi.BatchFilesClient
+	BatchDB         dbapi.BatchDBClient
+	BatchProgressDB dbapi.BatchProgressDBClient
+	FileDB          dbapi.FileDBClient
+	Queue           dbapi.BatchPriorityQueueClient
+	Event           dbapi.BatchEventChannelClient
+	EventGC         dbapi.BatchEventGC
+	Resumable       dbapi.ResumableStore
+	Inference       *inference.GatewayResolver
+	AsyncInference  *inference.AsyncGatewayResolver
 }
 
 // NewFSFileClient creates a filesystem-based file storage client.
@@ -95,7 +95,7 @@ func NewS3FileClient(ctx context.Context, cfg *s3client.Config) (fsapi.BatchFile
 
 // NewPostgreSQLDBClients creates PostgreSQL-backed batch and file database clients.
 // It reads the URL from the mounted secrets when not set in the config.
-func NewPostgreSQLDBClients(ctx context.Context, cfg *postgresql.PostgreSQLConfig) (dbapi.BatchDBClient, dbapi.FileDBClient, error) {
+func NewPostgreSQLDBClients(ctx context.Context, cfg *postgresql.PostgreSQLConfig) (*postgresql.PostgresBatchDBClient, dbapi.FileDBClient, error) {
 	if cfg == nil {
 		return nil, nil, fmt.Errorf("postgresql config cannot be nil")
 	}
@@ -124,7 +124,6 @@ type Option func(*clientsetConfig)
 type clientsetConfig struct {
 	dbCfg             *sharedcfg.DBClientConfig
 	fileCfg           *sharedcfg.FileClientConfig
-	exchangeRedisCfg  *uredis.RedisClientConfig
 	inferenceGlobal   *inference.GatewayClientConfig
 	inferencePerModel map[string]inference.GatewayClientConfig
 	asyncInference    *inference.AsyncClientConfig
@@ -139,12 +138,6 @@ func WithDB(cfg sharedcfg.DBClientConfig) Option {
 // WithFile enables creation of the file storage client.
 func WithFile(cfg sharedcfg.FileClientConfig) Option {
 	return func(c *clientsetConfig) { c.fileCfg = &cfg }
-}
-
-// WithExchange enables creation of the Redis exchange client (Queue, Event, Status).
-func WithExchange(cfg uredis.RedisClientConfig) Option {
-	cfg = cfg.DeepCopy()
-	return func(c *clientsetConfig) { c.exchangeRedisCfg = &cfg }
 }
 
 // WithGlobalInference enables creation of a global inference client.
@@ -187,28 +180,6 @@ func NewClientset(ctx context.Context, component ucom.Component, opts ...Option)
 		}
 	}()
 
-	// build redis exchange client
-	if cfg.exchangeRedisCfg != nil {
-		// TODO: The exchange interfaces (priority queue, events, status) currently always use Redis.
-		// Consider adding a separate type parameter for these if we need alternative backends.
-		// See: https://github.com/llm-d/llm-d-batch-gateway/pull/102#discussion_r2906181334
-		if cfg.exchangeRedisCfg.Url == "" {
-			redisURL, err := ucom.ReadSecretFile(ucom.SecretKeyRedisURL)
-			if err != nil {
-				return nil, err
-			}
-			cfg.exchangeRedisCfg.Url = redisURL
-		}
-		redisClient, err := dbRedis.NewExchangeDBClientRedis(ctx, nil, cfg.exchangeRedisCfg, 0)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create redis exchange client: %w", err)
-		}
-		logger.Info("Redis exchange client created")
-		cs.Queue = redisClient
-		cs.Event = redisClient
-		cs.Status = redisClient
-	}
-
 	// build file store client
 	if cfg.fileCfg != nil {
 		switch cfg.fileCfg.Type {
@@ -246,6 +217,7 @@ func NewClientset(ctx context.Context, component ucom.Component, opts ...Option)
 
 			var processorID string
 			if component == ucom.ComponentProcessor {
+				cs.BatchProgressDB = batchDB
 				processorID, err = os.Hostname()
 				if err != nil {
 					return nil, fmt.Errorf("failed to get hostname for processor ID: %w", err)
@@ -255,9 +227,37 @@ func NewClientset(ctx context.Context, component ucom.Component, opts ...Option)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create postgres queue client: %w", err)
 			}
-			// Postgres queue intentionally replaces the Redis queue set above.
-			// Redis is retained only for Event and Status channels.
 			cs.Queue = queueClient
+
+			// The resumable store serves the processor (activation, leases,
+			// entry writes) and the GC (orphan requeue); the apiserver has no
+			// resumable role.
+			if component == ucom.ComponentProcessor || component == ucom.ComponentGC {
+				resumable, err := postgresql.NewPostgresResumableStore(ctx, &cfg.dbCfg.PostgreSQLCfg)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create postgres resumable store: %w", err)
+				}
+				cs.Resumable = resumable
+			}
+
+			var eventClient dbapi.BatchEventChannelClient
+			switch component {
+			case ucom.ComponentProcessor:
+				eventClient, err = postgresql.NewPostgresBatchEventClient(ctx, &cfg.dbCfg.PostgreSQLCfg, logger)
+			case ucom.ComponentApiserver:
+				eventClient, err = postgresql.NewPostgresBatchEventProducer(ctx, &cfg.dbCfg.PostgreSQLCfg)
+			case ucom.ComponentGC:
+				cs.EventGC, err = postgresql.NewPostgresBatchEventGC(batchDB, logger)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create postgres event GC: %w", err)
+				}
+			default:
+				return nil, fmt.Errorf("unsupported component for postgres events: %s", component)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("failed to create postgres event client for %s: %w", component, err)
+			}
+			cs.Event = eventClient
 		default:
 			return nil, fmt.Errorf("unsupported database.type: %s (supported values: postgresql)", cfg.dbCfg.Type)
 		}
@@ -266,13 +266,30 @@ func NewClientset(ctx context.Context, component ucom.Component, opts ...Option)
 	// build inference client(s)
 	switch {
 	case cfg.asyncInference != nil:
-		if cfg.asyncInference.RedisURL == "" {
-			if cfg.exchangeRedisCfg == nil {
-				return nil, fmt.Errorf("async inference requires a Redis URL (set RedisURL or use WithExchange)")
-			}
-			cfg.asyncInference.RedisURL = cfg.exchangeRedisCfg.Url
+		transport, err := inference.NormalizeAsyncTransport(cfg.asyncInference.Transport)
+		if err != nil {
+			return nil, err
 		}
-		resolver, err := inference.NewAsyncResolver(*cfg.asyncInference, logger)
+		cfg.asyncInference.Transport = transport
+		switch transport {
+		case inference.AsyncTransportRedisSortedSet:
+			if cfg.asyncInference.RedisURL == "" {
+				redisURL, err := ucom.ReadSecretFile(ucom.SecretKeyRedisURL)
+				if err != nil {
+					return nil, fmt.Errorf("async Redis transport requires a Redis URL (set RedisURL or configure secret %s): %w", ucom.SecretKeyRedisURL, err)
+				}
+				cfg.asyncInference.RedisURL = redisURL
+			}
+		case inference.AsyncTransportSQL:
+			if cfg.dbCfg == nil || cfg.dbCfg.Type != sharedcfg.DBTypePostgreSQL {
+				return nil, fmt.Errorf("async SQL transport requires a PostgreSQL database client")
+			}
+			cfg.asyncInference.SQLURL = cfg.dbCfg.PostgreSQLCfg.Url
+			if cfg.asyncInference.SQLURL == "" {
+				return nil, fmt.Errorf("async SQL transport requires a PostgreSQL URL")
+			}
+		}
+		resolver, err := inference.NewAsyncResolver(ctx, *cfg.asyncInference, logger)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create async inference clients: %w", err)
 		}
@@ -309,8 +326,8 @@ func (cs *Clientset) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	if cs.Status != nil {
-		if err := cs.Status.Close(); err != nil {
+	if cs.Resumable != nil {
+		if err := cs.Resumable.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}

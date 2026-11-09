@@ -19,10 +19,12 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/ptr"
+	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
 
 // validPerModelConfig returns a minimal valid per-model gateway config for tests.
@@ -62,8 +64,17 @@ func TestNewConfig_Defaults(t *testing.T) {
 	if c.TaskWaitTime != 1*time.Second {
 		t.Fatalf("TaskWaitTime = %v, want %v", c.TaskWaitTime, 1*time.Second)
 	}
-	if c.NumWorkers != 1 {
-		t.Fatalf("NumWorkers = %d, want %d", c.NumWorkers, 1)
+	if c.NumWorkers != DefaultNumWorkers {
+		t.Fatalf("NumWorkers = %d, want %d", c.NumWorkers, DefaultNumWorkers)
+	}
+	if c.WorkDirSizeLimit != DefaultWorkDirSizeLimit {
+		t.Fatalf("WorkDirSizeLimit = %q, want %q", c.WorkDirSizeLimit, DefaultWorkDirSizeLimit)
+	}
+	if c.InputFileDiskBudgetPercent != DefaultInputFileDiskBudgetPercent {
+		t.Fatalf("InputFileDiskBudgetPercent = %d, want %d", c.InputFileDiskBudgetPercent, DefaultInputFileDiskBudgetPercent)
+	}
+	if c.MaxInputFileSizeBytes != DefaultMaxInputFileSizeBytes {
+		t.Fatalf("MaxInputFileSizeBytes = %d, want %d", c.MaxInputFileSizeBytes, DefaultMaxInputFileSizeBytes)
 	}
 	if c.Concurrency.Global != 100 {
 		t.Fatalf("Concurrency.Global = %d, want %d", c.Concurrency.Global, 100)
@@ -97,19 +108,127 @@ func TestNewConfig_Defaults(t *testing.T) {
 	if c.DefaultOutputExpirationSeconds != want90Days {
 		t.Fatalf("DefaultOutputExpirationSeconds = %d, want %d", c.DefaultOutputExpirationSeconds, want90Days)
 	}
-	if c.ProgressTTLSeconds != 86400 {
-		t.Fatalf("ProgressTTLSeconds = %d, want %d", c.ProgressTTLSeconds, 86400)
-	}
 	if c.DispatchMode != DispatchModeSync {
 		t.Fatalf("DispatchMode = %q, want %q", c.DispatchMode, DispatchModeSync)
 	}
 	if c.AsyncDispatchConfig.ResultPollTimeout != 5*time.Second {
 		t.Fatalf("AsyncDispatchConfig.ResultPollTimeout = %v, want %v", c.AsyncDispatchConfig.ResultPollTimeout, 5*time.Second)
 	}
+	if c.Resumable.LeaseDuration != 5*time.Minute {
+		t.Fatalf("Resumable.LeaseDuration = %v, want %v", c.Resumable.LeaseDuration, 5*time.Minute)
+	}
+	if c.Resumable.FinalizeConcurrency != 16 {
+		t.Fatalf("Resumable.FinalizeConcurrency = %d, want 16", c.Resumable.FinalizeConcurrency)
+	}
+	if c.Resumable.FinalizeTimeout != 30*time.Minute {
+		t.Fatalf("Resumable.FinalizeTimeout = %v, want %v", c.Resumable.FinalizeTimeout, 30*time.Minute)
+	}
+}
+
+func TestProcessorConfig_Validate_Resumable(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*ResumableConfig)
+		wantErr bool
+	}{
+		{name: "defaults are valid", mutate: func(*ResumableConfig) {}},
+		{name: "zero lease duration", mutate: func(r *ResumableConfig) { r.LeaseDuration = 0 }, wantErr: true},
+		{name: "negative lease duration", mutate: func(r *ResumableConfig) { r.LeaseDuration = -time.Second }, wantErr: true},
+		{name: "sub-second lease duration", mutate: func(r *ResumableConfig) { r.LeaseDuration = 500 * time.Millisecond }, wantErr: true},
+		{name: "non-whole-second lease duration", mutate: func(r *ResumableConfig) { r.LeaseDuration = 1500 * time.Millisecond }, wantErr: true},
+		{name: "zero finalize concurrency", mutate: func(r *ResumableConfig) { r.FinalizeConcurrency = 0 }, wantErr: true},
+		{name: "zero finalize timeout", mutate: func(r *ResumableConfig) { r.FinalizeTimeout = 0 }, wantErr: true},
+		{name: "tuned values are valid", mutate: func(r *ResumableConfig) {
+			r.LeaseDuration = time.Minute
+			r.FinalizeConcurrency = 4
+			r.FinalizeTimeout = 5 * time.Minute
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewConfig()
+			c.DispatchMode = DispatchModeAsync
+			c.AsyncDispatchConfig.Models = map[string]AsyncModelConfig{
+				"model-a": {InferencePoolName: "pool-a"},
+				"model-b": {InferencePoolName: "pool-b"},
+			}
+			c.NumWorkers = 5
+			tt.mutate(&c.Resumable)
+
+			err := c.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatal("Validate() error = nil, want error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("Validate() unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestProcessorConfig_Validate_ExtraEndpoints(t *testing.T) {
+	c := NewConfig()
+	c.ModelGateways = validPerModelConfig()
+	c.ExtraEndpoints = []string{"/v1/classify", "/v1/pooling"}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected error: %v", err)
+	}
+
+	c.ExtraEndpoints = []string{"/v1/classify?mode=test"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate() expected error for invalid extra endpoint")
+	}
+}
+
+func TestProcessorConfig_EffectiveNumWorkers(t *testing.T) {
+	tests := []struct {
+		name      string
+		workers   int
+		sizeLimit string
+		percent   int
+		fileSize  int64
+		want      int
+		wantErr   bool
+	}{
+		{name: "default chart capacity caps twenty workers at five", workers: 20, sizeLimit: "10Gi", percent: 10, want: 5},
+		{name: "configured workers remain the lower cap", workers: 4, sizeLimit: "10Gi", percent: 10, want: 4},
+		{name: "larger input budget allows all configured workers", workers: 20, sizeLimit: "10Gi", percent: 50, want: 20},
+		{name: "larger allowed input reduces the cap", workers: 20, sizeLimit: "10Gi", percent: 10, fileSize: 512 << 20, want: 2},
+		{name: "budget too small for one file is rejected", workers: 20, sizeLimit: "1Gi", percent: 10, wantErr: true},
+		{name: "invalid percentage is rejected", workers: 20, sizeLimit: "10Gi", percent: 0, wantErr: true},
+		{name: "invalid size is rejected", workers: 20, sizeLimit: "not-a-size", percent: 10, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := NewConfig()
+			cfg.NumWorkers = tt.workers
+			cfg.WorkDirSizeLimit = tt.sizeLimit
+			cfg.InputFileDiskBudgetPercent = tt.percent
+			if tt.fileSize != 0 {
+				cfg.MaxInputFileSizeBytes = tt.fileSize
+			}
+
+			got, err := cfg.EffectiveNumWorkers()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("EffectiveNumWorkers() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("EffectiveNumWorkers() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("EffectiveNumWorkers() = %d, want %d", got, tt.want)
+			}
+		})
+	}
 }
 
 func TestProcessorConfig_Validate_WorkDirEmpty(t *testing.T) {
 	c := NewConfig()
+	c.DispatchMode = DispatchModeSync
 	c.ModelGateways = validPerModelConfig()
 	c.WorkDir = ""
 	if err := c.Validate(); err == nil {
@@ -119,6 +238,7 @@ func TestProcessorConfig_Validate_WorkDirEmpty(t *testing.T) {
 
 func TestProcessorConfig_Validate_TaskWaitTimeMustBeShorterThanPollInterval(t *testing.T) {
 	c := NewConfig()
+	c.DispatchMode = DispatchModeSync
 	c.ModelGateways = validPerModelConfig()
 	c.DBClientCfg.Type = "mock"
 	c.PollInterval = 1 * time.Second
@@ -138,6 +258,7 @@ func TestProcessorConfig_LoadFromYAML_ExplicitZeroMaxRetries(t *testing.T) {
 	path := filepath.Join(dir, "cfg.yaml")
 
 	yamlData := []byte(`
+dispatch_mode: sync
 poll_interval: 5s
 task_wait_time: 1s
 num_workers: 1
@@ -179,7 +300,6 @@ model_gateways:
     max_retries: 0
     initial_backoff: 1s
     max_backoff: 60s
-progress_ttl_seconds: 86400
 `)
 
 	if err := os.WriteFile(path, yamlData, 0o600); err != nil {
@@ -227,6 +347,7 @@ progress_ttl_seconds: 86400
 
 func TestProcessorConfig_Validate_NeitherGlobalNorPerModel(t *testing.T) {
 	c := NewConfig()
+	c.DispatchMode = DispatchModeSync
 	if err := c.Validate(); err == nil {
 		t.Fatal("Validate() expected error when neither global nor per-model is configured")
 	}
@@ -234,6 +355,7 @@ func TestProcessorConfig_Validate_NeitherGlobalNorPerModel(t *testing.T) {
 
 func TestProcessorConfig_Validate_GlobalOnly(t *testing.T) {
 	c := NewConfig()
+	c.DispatchMode = DispatchModeSync
 	c.GlobalInferenceGateway = validGlobalConfig()
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate() unexpected error with global-only config: %v", err)
@@ -242,6 +364,7 @@ func TestProcessorConfig_Validate_GlobalOnly(t *testing.T) {
 
 func TestProcessorConfig_Validate_PerModelWithoutDefault(t *testing.T) {
 	c := NewConfig()
+	c.DispatchMode = DispatchModeSync
 	c.ModelGateways = validPerModelConfig()
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate() unexpected error with per-model-only config: %v", err)
@@ -250,6 +373,7 @@ func TestProcessorConfig_Validate_PerModelWithoutDefault(t *testing.T) {
 
 func TestProcessorConfig_Validate_GlobalAndPerModelMutuallyExclusive(t *testing.T) {
 	c := NewConfig()
+	c.DispatchMode = DispatchModeSync
 	c.GlobalInferenceGateway = validGlobalConfig()
 	c.ModelGateways = validPerModelConfig()
 	if err := c.Validate(); err == nil {
@@ -260,6 +384,7 @@ func TestProcessorConfig_Validate_GlobalAndPerModelMutuallyExclusive(t *testing.
 func TestProcessorConfig_Validate_APIKeyFile(t *testing.T) {
 	t.Run("name_and_file_mutually_exclusive", func(t *testing.T) {
 		c := NewConfig()
+		c.DispatchMode = DispatchModeSync
 		c.ModelGateways = map[string]ModelGatewayConfig{
 			"llama-3": {
 				URL:            "http://gw:8000",
@@ -278,6 +403,7 @@ func TestProcessorConfig_Validate_APIKeyFile(t *testing.T) {
 
 	t.Run("file_not_found", func(t *testing.T) {
 		c := NewConfig()
+		c.DispatchMode = DispatchModeSync
 		c.ModelGateways = map[string]ModelGatewayConfig{
 			"llama-3": {
 				URL:            "http://gw:8000",
@@ -301,6 +427,7 @@ func TestProcessorConfig_Validate_APIKeyFile(t *testing.T) {
 		}
 
 		c := NewConfig()
+		c.DispatchMode = DispatchModeSync
 		c.ModelGateways = map[string]ModelGatewayConfig{
 			"llama-3": {
 				URL:            "http://gw:8000",
@@ -324,6 +451,7 @@ func TestProcessorConfig_Validate_APIKeyFile(t *testing.T) {
 		}
 
 		cfg := NewConfig()
+		cfg.DispatchMode = DispatchModeSync
 		cfg.ModelGateways = map[string]ModelGatewayConfig{
 			"llama-3": {
 				URL:            "http://gateway:8000",
@@ -349,6 +477,7 @@ func TestProcessorConfig_Validate_APIKeyFile(t *testing.T) {
 
 func TestProcessorConfig_Validate_GatewayTLSPartialConfigRejected(t *testing.T) {
 	c := NewConfig()
+	c.DispatchMode = DispatchModeSync
 	c.ModelGateways = map[string]ModelGatewayConfig{
 		"llama-3": {
 			URL:               "http://gw:8000",
@@ -380,6 +509,7 @@ func TestProcessorConfig_Validate_GatewayTLSPartialConfigRejected(t *testing.T) 
 
 func TestProcessorConfig_Validate_MinimumValueChecks(t *testing.T) {
 	c := NewConfig()
+	c.DispatchMode = DispatchModeSync
 	c.ModelGateways = validPerModelConfig()
 	c.NumWorkers = 0
 	if err := c.Validate(); err == nil {
@@ -387,6 +517,7 @@ func TestProcessorConfig_Validate_MinimumValueChecks(t *testing.T) {
 	}
 
 	c = NewConfig()
+	c.DispatchMode = DispatchModeSync
 	c.ModelGateways = validPerModelConfig()
 	c.Concurrency.Global = 0
 	if err := c.Validate(); err == nil {
@@ -394,6 +525,7 @@ func TestProcessorConfig_Validate_MinimumValueChecks(t *testing.T) {
 	}
 
 	c = NewConfig()
+	c.DispatchMode = DispatchModeSync
 	c.ModelGateways = validPerModelConfig()
 	c.Concurrency.PerEndpoint = 0
 	if err := c.Validate(); err == nil {
@@ -401,6 +533,7 @@ func TestProcessorConfig_Validate_MinimumValueChecks(t *testing.T) {
 	}
 
 	c = NewConfig()
+	c.DispatchMode = DispatchModeSync
 	c.ModelGateways = validPerModelConfig()
 	c.ShutdownTimeout = 0
 	if err := c.Validate(); err == nil {
@@ -408,6 +541,7 @@ func TestProcessorConfig_Validate_MinimumValueChecks(t *testing.T) {
 	}
 
 	c = NewConfig()
+	c.DispatchMode = DispatchModeSync
 	c.ModelGateways = validPerModelConfig()
 	c.Concurrency.Recovery = 0
 	if err := c.Validate(); err == nil {
@@ -415,6 +549,7 @@ func TestProcessorConfig_Validate_MinimumValueChecks(t *testing.T) {
 	}
 
 	c = NewConfig()
+	c.DispatchMode = DispatchModeSync
 	c.ModelGateways = map[string]ModelGatewayConfig{
 		"llama-3": {
 			URL:            "http://gw:8000",
@@ -432,6 +567,7 @@ func TestProcessorConfig_Validate_MinimumValueChecks(t *testing.T) {
 func TestProcessorConfig_Validate_ConcurrencyAIMD(t *testing.T) {
 	t.Run("default config passes", func(t *testing.T) {
 		c := NewConfig()
+		c.DispatchMode = DispatchModeSync
 		c.ModelGateways = validPerModelConfig()
 		if err := c.Validate(); err != nil {
 			t.Fatalf("Validate() error: %v", err)
@@ -440,6 +576,7 @@ func TestProcessorConfig_Validate_ConcurrencyAIMD(t *testing.T) {
 
 	t.Run("backoff factor out of range", func(t *testing.T) {
 		c := NewConfig()
+		c.DispatchMode = DispatchModeSync
 		c.ModelGateways = validPerModelConfig()
 		c.Concurrency.AIMD.BackoffFactor = 1.5
 		if err := c.Validate(); err == nil {
@@ -449,6 +586,7 @@ func TestProcessorConfig_Validate_ConcurrencyAIMD(t *testing.T) {
 
 	t.Run("min > per_endpoint", func(t *testing.T) {
 		c := NewConfig()
+		c.DispatchMode = DispatchModeSync
 		c.Concurrency.Global = 10
 		c.Concurrency.PerEndpoint = 5
 		c.Concurrency.AIMD.Min = 20
@@ -460,6 +598,7 @@ func TestProcessorConfig_Validate_ConcurrencyAIMD(t *testing.T) {
 
 	t.Run("min > per_endpoint second case", func(t *testing.T) {
 		c := NewConfig()
+		c.DispatchMode = DispatchModeSync
 		c.Concurrency.Global = 100
 		c.Concurrency.PerEndpoint = 5
 		c.Concurrency.AIMD.Min = 10
@@ -471,6 +610,7 @@ func TestProcessorConfig_Validate_ConcurrencyAIMD(t *testing.T) {
 
 	t.Run("fixed limit when min equals per_endpoint", func(t *testing.T) {
 		c := NewConfig()
+		c.DispatchMode = DispatchModeSync
 		c.Concurrency.Global = 50
 		c.Concurrency.PerEndpoint = 10
 		c.Concurrency.AIMD.Min = 10
@@ -498,6 +638,7 @@ func TestProcessorConfig_Validate_ConcurrencyAIMD(t *testing.T) {
 
 	t.Run("zero backoff_factor rejected by Validate", func(t *testing.T) {
 		c := NewConfig()
+		c.DispatchMode = DispatchModeSync
 		c.ModelGateways = validPerModelConfig()
 		c.Concurrency.AIMD.BackoffFactor = 0
 		if err := c.Validate(); err == nil {
@@ -507,6 +648,7 @@ func TestProcessorConfig_Validate_ConcurrencyAIMD(t *testing.T) {
 
 	t.Run("AIMD disabled skips AIMD validation", func(t *testing.T) {
 		c := NewConfig()
+		c.DispatchMode = DispatchModeSync
 		c.ModelGateways = validPerModelConfig()
 		c.Concurrency.AIMD.Enabled = false
 		c.Concurrency.AIMD.BackoffFactor = 0
@@ -518,6 +660,7 @@ func TestProcessorConfig_Validate_ConcurrencyAIMD(t *testing.T) {
 
 	t.Run("zero min rejected", func(t *testing.T) {
 		c := NewConfig()
+		c.DispatchMode = DispatchModeSync
 		c.ModelGateways = validPerModelConfig()
 		c.Concurrency.AIMD.Min = 0
 		if err := c.Validate(); err == nil {
@@ -527,6 +670,7 @@ func TestProcessorConfig_Validate_ConcurrencyAIMD(t *testing.T) {
 
 	t.Run("zero additive_increase rejected", func(t *testing.T) {
 		c := NewConfig()
+		c.DispatchMode = DispatchModeSync
 		c.ModelGateways = validPerModelConfig()
 		c.Concurrency.AIMD.AdditiveIncrease = 0
 		if err := c.Validate(); err == nil {
@@ -540,6 +684,7 @@ func TestProcessorConfig_LoadFromYAML(t *testing.T) {
 	path := filepath.Join(dir, "cfg.yaml")
 
 	yamlData := []byte(`
+dispatch_mode: sync
 poll_interval: 2s
 task_wait_time: 500ms
 num_workers: 3
@@ -563,7 +708,6 @@ model_gateways:
     max_backoff: 10s
     tls_insecure_skip_verify: true
 default_output_expiration_seconds: 86400
-progress_ttl_seconds: 3600
 send_fairness_header: true
 route_key_method: tenant
 `)
@@ -637,9 +781,6 @@ route_key_method: tenant
 	if c.DefaultOutputExpirationSeconds != 86400 {
 		t.Fatalf("DefaultOutputExpirationSeconds = %d, want %d", c.DefaultOutputExpirationSeconds, 86400)
 	}
-	if c.ProgressTTLSeconds != 3600 {
-		t.Fatalf("ProgressTTLSeconds = %d, want %d", c.ProgressTTLSeconds, 3600)
-	}
 	if !c.SendFairnessHeader {
 		t.Fatalf("SendFairnessHeader = false, want true")
 	}
@@ -648,9 +789,73 @@ route_key_method: tenant
 	}
 }
 
+func TestProcessorConfig_AsyncTransportAndPollIntervalFlowFromYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	const yamlData = `
+dispatch_mode: async
+async_dispatch:
+  transport: sql
+  poll_interval: 275ms
+  max_connections: 7
+  result_poll_timeout: 11s
+  models:
+    model-a:
+      inference_pool_name: pool-a
+      request_queue_name: "custom:requests"
+      result_queue_name: "custom:results"
+`
+	if err := os.WriteFile(path, []byte(yamlData), 0o600); err != nil {
+		t.Fatalf("write YAML: %v", err)
+	}
+
+	cfg := NewConfig()
+	if err := cfg.LoadFromYAML(path); err != nil {
+		t.Fatalf("LoadFromYAML: %v", err)
+	}
+	if cfg.AsyncDispatchConfig.Transport != inference.AsyncTransportSQL {
+		t.Fatalf("parsed transport = %q, want %q", cfg.AsyncDispatchConfig.Transport, inference.AsyncTransportSQL)
+	}
+	if cfg.AsyncDispatchConfig.PollInterval != 275*time.Millisecond {
+		t.Fatalf("parsed poll interval = %v, want 275ms", cfg.AsyncDispatchConfig.PollInterval)
+	}
+	if cfg.AsyncDispatchConfig.MaxConnections != 7 {
+		t.Fatalf("parsed max connections = %d, want 7", cfg.AsyncDispatchConfig.MaxConnections)
+	}
+
+	resolved, err := ResolveModelGateways(cfg)
+	if err != nil {
+		t.Fatalf("ResolveModelGateways: %v", err)
+	}
+	if resolved.Async == nil {
+		t.Fatal("expected resolved async configuration")
+	}
+	if resolved.Async.Transport != inference.AsyncTransportSQL {
+		t.Fatalf("resolved transport = %q, want %q", resolved.Async.Transport, inference.AsyncTransportSQL)
+	}
+	if resolved.Async.PollInterval != 275*time.Millisecond {
+		t.Fatalf("resolved poll interval = %v, want 275ms", resolved.Async.PollInterval)
+	}
+	if resolved.Async.MaxConnections != 7 {
+		t.Fatalf("resolved max connections = %d, want 7", resolved.Async.MaxConnections)
+	}
+	if resolved.Async.ResultPollTimeout != 11*time.Second {
+		t.Fatalf("resolved result poll timeout = %v, want 11s", resolved.Async.ResultPollTimeout)
+	}
+	if resolved.Async.Models["model-a"].PoolName != "pool-a" {
+		t.Fatalf("resolved model pool = %q, want pool-a", resolved.Async.Models["model-a"].PoolName)
+	}
+	if resolved.Async.Models["model-a"].RequestQueueName != "custom:requests" {
+		t.Fatalf("resolved request queue = %q, want custom:requests", resolved.Async.Models["model-a"].RequestQueueName)
+	}
+	if resolved.Async.Models["model-a"].ResultQueueName != "custom:results" {
+		t.Fatalf("resolved result queue = %q, want custom:results", resolved.Async.Models["model-a"].ResultQueueName)
+	}
+}
+
 func TestValidate_RouteKeyMethod(t *testing.T) {
 	base := func() *ProcessorConfig {
 		c := NewConfig()
+		c.DispatchMode = DispatchModeSync
 		c.ModelGateways = validPerModelConfig()
 		return c
 	}
@@ -678,7 +883,9 @@ func TestProcessorConfig_Validate_AsyncDispatch(t *testing.T) {
 		c := NewConfig()
 		c.DispatchMode = DispatchModeAsync
 		c.AsyncDispatchConfig = AsyncDispatchConfig{
+			MaxConnections:    inference.DefaultSQLMaxConns,
 			ResultPollTimeout: 5 * time.Second,
+			PollInterval:      time.Second,
 			Models: map[string]AsyncModelConfig{
 				"llama-3": {InferencePoolName: "pool-a"},
 			},
@@ -697,6 +904,35 @@ func TestProcessorConfig_Validate_AsyncDispatch(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "SQL transport is valid",
+			mutate: func(c *ProcessorConfig) {
+				c.AsyncDispatchConfig.Transport = inference.AsyncTransportSQL
+			},
+			wantErr: false,
+		},
+		{
+			name: "SQL transport requires max connections",
+			mutate: func(c *ProcessorConfig) {
+				c.AsyncDispatchConfig.Transport = inference.AsyncTransportSQL
+				c.AsyncDispatchConfig.MaxConnections = 0
+			},
+			wantErr: true,
+		},
+		{
+			name: "redis transport ignores max connections",
+			mutate: func(c *ProcessorConfig) {
+				c.AsyncDispatchConfig.MaxConnections = 0
+			},
+			wantErr: false,
+		},
+		{
+			name: "unknown async transport rejected",
+			mutate: func(c *ProcessorConfig) {
+				c.AsyncDispatchConfig.Transport = "unknown"
+			},
+			wantErr: true,
+		},
+		{
 			name: "sync mode ignores async fields",
 			mutate: func(c *ProcessorConfig) {
 				c.DispatchMode = DispatchModeSync
@@ -710,7 +946,6 @@ func TestProcessorConfig_Validate_AsyncDispatch(t *testing.T) {
 			mutate: func(c *ProcessorConfig) {
 				c.DispatchMode = DispatchMode("")
 				c.ModelGateways = validPerModelConfig()
-				c.AsyncDispatchConfig = AsyncDispatchConfig{}
 			},
 			wantErr: false,
 		},
@@ -722,6 +957,11 @@ func TestProcessorConfig_Validate_AsyncDispatch(t *testing.T) {
 		{
 			name:    "async zero result_poll_timeout",
 			mutate:  func(c *ProcessorConfig) { c.AsyncDispatchConfig.ResultPollTimeout = 0 },
+			wantErr: true,
+		},
+		{
+			name:    "async zero poll_interval",
+			mutate:  func(c *ProcessorConfig) { c.AsyncDispatchConfig.PollInterval = 0 },
 			wantErr: true,
 		},
 		{
@@ -820,15 +1060,123 @@ func TestProcessorConfig_Validate_AsyncDispatch(t *testing.T) {
 	}
 }
 
-func TestValidate_NormalizesEmptyDispatchMode(t *testing.T) {
-	c := NewConfig()
-	c.ModelGateways = validPerModelConfig()
-	c.DispatchMode = DispatchMode("")
-	if err := c.Validate(); err != nil {
-		t.Fatalf("Validate() unexpected error: %v", err)
+func TestProcessorConfig_DispatchMode(t *testing.T) {
+	modes := []struct {
+		name string
+		yaml string
+		want DispatchMode
+	}{
+		{name: "default", yaml: "{}", want: DispatchModeSync},
+		{name: "empty", yaml: "dispatch_mode: \"\"", want: DispatchModeSync},
+		{name: "explicit async", yaml: "dispatch_mode: async", want: DispatchModeAsync},
+		{name: "explicit sync", yaml: "dispatch_mode: sync", want: DispatchModeSync},
 	}
-	if c.DispatchMode != DispatchModeSync {
-		t.Fatalf("DispatchMode = %q after Validate(), want %q", c.DispatchMode, DispatchModeSync)
+	targets := []struct {
+		name     string
+		async    bool
+		global   bool
+		perModel bool
+		asyncErr string
+		syncErr  string
+	}{
+		{
+			name:     "no targets",
+			asyncErr: "async_dispatch.models must be configured",
+			syncErr:  "either global_inference_gateway or model_gateways must be configured",
+		},
+		{
+			name:    "async mappings",
+			async:   true,
+			syncErr: "either global_inference_gateway or model_gateways must be configured",
+		},
+		{
+			name:     "global gateway",
+			global:   true,
+			asyncErr: "global_inference_gateway is not supported",
+		},
+		{
+			name:     "per-model gateways",
+			perModel: true,
+			asyncErr: "async_dispatch.models must be configured",
+		},
+		{
+			name:     "async mappings and per-model gateways",
+			async:    true,
+			perModel: true,
+		},
+	}
+	for _, mode := range modes {
+		t.Run(mode.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(mode.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for _, target := range targets {
+				t.Run(target.name, func(t *testing.T) {
+					c := NewConfig()
+					if err := c.LoadFromYAML(path); err != nil {
+						t.Fatal(err)
+					}
+					if target.async {
+						c.AsyncDispatchConfig.Models = map[string]AsyncModelConfig{
+							"llama-3": {InferencePoolName: "pool-a"},
+						}
+					}
+					if target.global {
+						c.GlobalInferenceGateway = validGlobalConfig()
+					}
+					if target.perModel {
+						c.ModelGateways = validPerModelConfig()
+					}
+					wantErr := target.asyncErr
+					if mode.want == DispatchModeSync {
+						wantErr = target.syncErr
+					}
+					err := c.Validate()
+					if c.DispatchMode != mode.want {
+						t.Fatalf("DispatchMode = %q after Validate(), want %q", c.DispatchMode, mode.want)
+					}
+					if wantErr != "" {
+						if err == nil || !strings.Contains(err.Error(), wantErr) {
+							t.Fatalf("Validate() error = %v, want %q", err, wantErr)
+						}
+						if mode.want == DispatchModeAsync {
+							for _, hint := range []string{"async_dispatch.models", "explicitly set dispatch_mode: sync"} {
+								if !strings.Contains(err.Error(), hint) {
+									t.Errorf("Validate() error = %v, missing guidance %q", err, hint)
+								}
+							}
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("Validate() unexpected error: %v", err)
+					}
+					resolved, err := ResolveModelGateways(c)
+					if err != nil {
+						t.Fatalf("ResolveModelGateways() error: %v", err)
+					}
+					if mode.want == DispatchModeAsync {
+						if resolved.Async == nil || resolved.Global != nil || resolved.PerModel != nil {
+							t.Fatalf("expected only async targets, got %+v", resolved)
+						}
+						if resolved.Async.Models["llama-3"].PoolName != "pool-a" {
+							t.Fatalf("unexpected async models: %v", resolved.Async.Models)
+						}
+						return
+					}
+					if resolved.Async != nil || (resolved.Global != nil) != target.global || (resolved.PerModel != nil) != target.perModel {
+						t.Fatalf("expected explicit sync targets, got %+v", resolved)
+					}
+					if target.global && resolved.Global.URL != c.GlobalInferenceGateway.URL {
+						t.Errorf("global URL = %q, want %q", resolved.Global.URL, c.GlobalInferenceGateway.URL)
+					}
+					if target.perModel && resolved.PerModel["llama-3"].URL != c.ModelGateways["llama-3"].URL {
+						t.Errorf("per-model URL = %q, want %q", resolved.PerModel["llama-3"].URL, c.ModelGateways["llama-3"].URL)
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -852,13 +1200,14 @@ func TestProcessorConfig_InferenceObjectiveFor(t *testing.T) {
 	}{
 		{
 			name:    "no objective configured anywhere",
-			cfg:     ProcessorConfig{ModelGateways: validPerModelConfig()},
+			cfg:     ProcessorConfig{DispatchMode: DispatchModeSync, ModelGateways: validPerModelConfig()},
 			modelID: "llama-3",
 			want:    "",
 		},
 		{
 			name: "per-model objective set",
 			cfg: ProcessorConfig{
+				DispatchMode: DispatchModeSync,
 				ModelGateways: map[string]ModelGatewayConfig{
 					"llama-3": {
 						URL:                "http://gw:8000",
@@ -876,6 +1225,7 @@ func TestProcessorConfig_InferenceObjectiveFor(t *testing.T) {
 		{
 			name: "unlisted model returns empty",
 			cfg: ProcessorConfig{
+				DispatchMode: DispatchModeSync,
 				ModelGateways: map[string]ModelGatewayConfig{
 					"llama-3": {
 						URL:                "http://gw:8000",
@@ -893,6 +1243,7 @@ func TestProcessorConfig_InferenceObjectiveFor(t *testing.T) {
 		{
 			name: "per-model empty returns empty",
 			cfg: ProcessorConfig{
+				DispatchMode: DispatchModeSync,
 				ModelGateways: map[string]ModelGatewayConfig{
 					"llama-3": {
 						URL:            "http://gw:8000",
@@ -909,6 +1260,7 @@ func TestProcessorConfig_InferenceObjectiveFor(t *testing.T) {
 		{
 			name: "global gateway with objective",
 			cfg: ProcessorConfig{
+				DispatchMode: DispatchModeSync,
 				GlobalInferenceGateway: &ModelGatewayConfig{
 					URL:                "http://global-gw:8000",
 					InferenceObjective: "batch-sheddable-global",
@@ -924,6 +1276,7 @@ func TestProcessorConfig_InferenceObjectiveFor(t *testing.T) {
 		{
 			name: "global gateway without objective returns empty",
 			cfg: ProcessorConfig{
+				DispatchMode: DispatchModeSync,
 				GlobalInferenceGateway: &ModelGatewayConfig{
 					URL:            "http://global-gw:8000",
 					RequestTimeout: ptr.To(5 * time.Minute),
@@ -1072,6 +1425,7 @@ func TestResolveModelGateways_Async(t *testing.T) {
 
 	t.Run("sync mode does not populate Async", func(t *testing.T) {
 		cfg := NewConfig()
+		cfg.DispatchMode = DispatchModeSync
 		cfg.ModelGateways = validPerModelConfig()
 
 		resolved, err := ResolveModelGateways(cfg)

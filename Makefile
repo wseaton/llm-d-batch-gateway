@@ -1,4 +1,4 @@
-.PHONY: help build build-apiserver build-processor build-gc run-apiserver run-processor run-gc run-apiserver-dev run-processor-dev run-gc-dev build-release package-release publish-helm-chart generate-release test test-coverage test-coverage-func clean lint fmt vet tidy install-tools deps-get deps-verify bench check check-container-tool ci image-build image-build-apiserver image-build-processor image-build-gc test-regression test-integration test-all test-e2e test-helm test-scripts dev-deploy dev-clean dev-rm-cluster pre-commit benchmark-local benchmark-local-teardown benchmark-gpu benchmark-gpu-teardown
+.PHONY: help build build-apiserver build-processor build-gc run-apiserver run-processor run-gc run-apiserver-dev run-processor-dev run-gc-dev build-release package-release publish-helm-chart generate-release test test-coverage test-coverage-func clean lint fmt vet tidy install-tools deps-get deps-verify bench check check-container-tool ci image-build image-build-apiserver image-build-processor image-build-gc test-regression test-integration test-postgres test-postgres-local test-all test-e2e test-helm test-scripts dev-deploy dev-clean dev-rm-cluster pre-commit benchmark-local benchmark-local-teardown benchmark-gpu benchmark-gpu-teardown
 
 SHELL := /usr/bin/env bash
 
@@ -169,10 +169,12 @@ test:
 	rm -f $$OUT; \
 	exit $$TEST_EXIT
 
-## test-scripts: Run shell script tests (stubbed-gh, no cluster/network needed)
+## test-scripts: Run shell script tests (stubbed tools, no cluster/network needed)
 test-scripts:
 	@echo "Running shell script tests..."
 	@bash scripts/generate-release_test.sh
+	@bash scripts/dev-deploy_test.sh
+	@bash benchmarks/setup_test.sh
 
 ## test-coverage: Run tests with coverage
 test-coverage:
@@ -328,22 +330,55 @@ test-regression:
 ## test-integration: Run integration tests (in-process server with mock backends and external service integration, no cluster needed)
 test-integration:
 	@echo "Running integration tests..."
-	@$(GO) test -v -tags=integration ./... || \
+	@$(GO) test $(GOFLAGS) -v -tags=integration ./... || \
 		(echo "\n❌ Integration tests failed" && exit 1)
 	@echo "\n✅ Integration tests passed!"
+
+## test-postgres: Run all PostgreSQL-backed tests (requires TEST_POSTGRES_URL)
+# Run these packages sequentially: the migration and recovery tests modify
+# batch_items and must not share a database concurrently.
+test-postgres:
+	@test -n "$(TEST_POSTGRES_URL)" || { echo "TEST_POSTGRES_URL is required for PostgreSQL-backed tests"; exit 1; }
+	$(GO) test -count=1 -v ./pkg/clients/inference
+	$(GO) test -count=1 -v ./internal/database/postgresql
+	$(GO) test -count=1 -v ./internal/processor/worker
+	$(GO) test -count=1 -v ./internal/apiserver/batch
+
+## test-postgres-local: Run PostgreSQL-backed tests in a disposable Docker or Podman container
+test-postgres-local:
+	@set -euo pipefail; \
+	tool=; \
+	for candidate in docker podman; do \
+		if command -v "$$candidate" >/dev/null 2>&1 && "$$candidate" info >/dev/null 2>&1; then tool="$$candidate"; break; fi; \
+	done; \
+	if [ -z "$$tool" ]; then echo "Docker or Podman must be available to run PostgreSQL-backed tests"; exit 1; fi; \
+	container="batch-gateway-test-pg-$$$$"; \
+	"$$tool" run --rm -d --name "$$container" \
+		-e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=batch_gateway_test \
+		-p 127.0.0.1::5432 docker.io/postgres:16 >/dev/null; \
+	trap '"$$tool" stop "$$container" >/dev/null 2>&1 || true' EXIT; \
+	ready=0; \
+	for ((attempt=0; attempt<60; attempt++)); do \
+		if "$$tool" exec "$$container" pg_isready -U postgres -d batch_gateway_test >/dev/null 2>&1; then ready=1; break; fi; \
+		sleep 1; \
+	done; \
+	if [ "$$ready" -ne 1 ]; then "$$tool" logs "$$container"; exit 1; fi; \
+	mapped="$$("$$tool" port "$$container" 5432/tcp)"; \
+	port="$${mapped##*:}"; \
+	TEST_POSTGRES_URL="postgres://postgres:postgres@127.0.0.1:$$port/batch_gateway_test?sslmode=disable" $(MAKE) test-postgres
 
 ## test-all: Run all tests (unit + regression + integration + scripts)
 test-all: test test-regression test-integration test-scripts
 
 KIND_CLUSTER_NAME ?= batch-gateway-dev
 
-## dev-deploy: Deploy batch-gateway to a local kind cluster with all dependencies
+## dev-deploy: Deploy batch-gateway in sync mode (set ENABLE_DISPATCHER=true for async fixtures)
 dev-deploy:
 	@bash scripts/dev-deploy.sh
 
-## dev-deploy-gie: Deploy with GIE integration (per-model EPP + InferenceObjectives)
+## dev-deploy-gie: Deploy with sync Router EPP integration (legacy target name)
 dev-deploy-gie:
-	@ENABLE_GIE=true bash scripts/dev-deploy.sh
+	@ENABLE_DISPATCHER=false ENABLE_GIE=true bash scripts/dev-deploy.sh
 
 ## dev-clean: Clean up dev deployment (removes all resources but keeps the kind cluster)
 dev-clean:
@@ -460,7 +495,7 @@ test-e2e:
 	@echo "Running E2E tests..."
 	@OUT=$$(mktemp); \
 	echo "Processor observability endpoint: auto-resolved by the e2e test helpers"; \
-	cd test/e2e && $(GO) test -v $(if $(TEST_OUTPUT),-json) -count=1 -timeout=30m $(if $(TEST_RUN),-run $(TEST_RUN)) ./... 2>&1 | tee $$OUT; \
+	cd test/e2e && $(GO) test -v $(if $(TEST_OUTPUT),-json) -count=1 -timeout=60m $(if $(TEST_RUN),-run $(TEST_RUN)) ./... 2>&1 | tee $$OUT; \
 	TEST_EXIT=$${PIPESTATUS[0]}; \
 	PASS_COUNT=$$(grep -- '--- PASS:' $$OUT 2>/dev/null | wc -l | tr -d ' '); \
 	FAIL_COUNT=$$(grep -- '--- FAIL:' $$OUT 2>/dev/null | wc -l | tr -d ' '); \

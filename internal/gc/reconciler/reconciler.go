@@ -56,9 +56,15 @@ type Result struct {
 type Reconciler struct {
 	batchDB         db.BatchDBClient
 	queue           db.BatchPriorityQueueClient
+	resumable       db.ResumableBatchLeaseStore
 	interval        time.Duration
 	dryRun          bool
 	onCycleComplete func(*Result)
+	// refreshLive, when set, re-reads the set of currently-Ready processor pods.
+	// It is invoked at the start of each cycle so the live set reflects actual
+	// pod readiness rather than only the last StatefulSet-stable snapshot — a
+	// freshly-Ready replica is then never mistaken for a dead owner.
+	refreshLive func(ctx context.Context) (map[string]bool, error)
 
 	mu             sync.RWMutex
 	liveProcessors map[string]bool
@@ -71,6 +77,7 @@ type Reconciler struct {
 func NewReconciler(
 	batchDB db.BatchDBClient,
 	queue db.BatchPriorityQueueClient,
+	resumable db.ResumableBatchLeaseStore,
 	interval time.Duration,
 	dryRun bool,
 	onCycleComplete func(*Result),
@@ -81,12 +88,16 @@ func NewReconciler(
 	if queue == nil {
 		return nil, fmt.Errorf("queue client is required")
 	}
+	if resumable == nil {
+		return nil, fmt.Errorf("resumable store is required")
+	}
 	if interval <= 0 {
 		return nil, fmt.Errorf("interval must be positive, got %v", interval)
 	}
 	return &Reconciler{
 		batchDB:         batchDB,
 		queue:           queue,
+		resumable:       resumable,
 		interval:        interval,
 		dryRun:          dryRun,
 		onCycleComplete: onCycleComplete,
@@ -102,6 +113,13 @@ func (r *Reconciler) SetLiveProcessors(processors map[string]bool) {
 	defer r.mu.Unlock()
 	r.liveProcessors = processors
 	r.snapshotReady = true
+}
+
+// SetLivePodRefresher installs a callback that re-reads the currently-Ready
+// processor pods. The reconciler invokes it at the start of each cycle so the
+// live set stays fresh even before the StatefulSet reports stable.
+func (r *Reconciler) SetLivePodRefresher(fn func(ctx context.Context) (map[string]bool, error)) {
+	r.refreshLive = fn
 }
 
 func (r *Reconciler) hasSnapshot() bool {
@@ -164,6 +182,18 @@ func (r *Reconciler) run(ctx context.Context) {
 		r.notifyCycle(result)
 	}()
 
+	// Refresh the live set from currently-Ready pods before triaging. This keeps
+	// a freshly-Ready replica (whose StatefulSet hasn't reported stable yet) from
+	// being mistaken for a dead owner. On error, fall back to the last snapshot.
+	if r.refreshLive != nil {
+		live, err := r.refreshLive(ctx)
+		if err != nil {
+			logger.Error(err, "Reconciler: live pod refresh failed; using last snapshot")
+		} else {
+			r.SetLiveProcessors(live)
+		}
+	}
+
 	if !r.hasSnapshot() {
 		logger.Info("Reconciler: no live processor snapshot yet, skipping cycle")
 		return
@@ -177,6 +207,10 @@ func (r *Reconciler) run(ctx context.Context) {
 	}
 
 	for _, job := range jobs {
+		if job.Resumable {
+			r.triageResumable(ctx, job, result)
+			continue
+		}
 		if !r.isProcessorAlive(job.ProcessorID) {
 			r.triageOrphan(ctx, job, result)
 		}
@@ -233,9 +267,47 @@ func (r *Reconciler) triageOrphan(ctx context.Context, job *db.BatchItem, result
 		if isSLOExpired(job) {
 			r.transitionOrphan(ctx, job, &statusInfo, openai.BatchStatusFailed, result, logger)
 		} else {
-			r.reEnqueueOrphan(ctx, job, result, logger)
+			r.reEnqueueOrphan(ctx, job, statusInfo.Status, result, logger)
 		}
 	}
+}
+
+// triageResumable handles an owned resumable batch: its persisted entry set
+// makes it recoverable, so it is requeued (never transitioned here) when the
+// owner is dead, or when the owner is alive but its lease has lapsed — the
+// wedged-owner trigger. Cancelling and SLO-expired orphans are requeued too;
+// the resuming processor routes them to their terminal state from the entry
+// set. A requeue that raced with a lease renewal is a fenced no-op.
+func (r *Reconciler) triageResumable(ctx context.Context, job *db.BatchItem, result *Result) {
+	ctx = logr.NewContext(ctx, logr.FromContextOrDiscard(ctx).WithValues("jobId", job.ID))
+	ctx, span := uotel.StartSpan(ctx, "reconciler.triage_resumable")
+	defer span.End()
+	span.SetAttributes(attribute.String(uotel.AttrBatchID, job.ID))
+	logger := logr.FromContextOrDiscard(ctx)
+
+	ownerAlive := r.isProcessorAlive(job.ProcessorID)
+	if ownerAlive && job.OwnerLeaseExpiresAt.After(time.Now()) {
+		return
+	}
+
+	if r.dryRun {
+		logger.Info("Reconciler: dry-run: would requeue resumable orphan", "ownerAlive", ownerAlive)
+		result.ReEnqueued++
+		return
+	}
+
+	// A confirmed pod death requeues regardless of the lease; an alive owner
+	// is only displaced once its lease has actually lapsed. The requeue
+	// counts one recovery attempt: the owner failed, and the budget bounds
+	// how often a batch is handed around before it is failed.
+	if err := r.resumable.RequeueResumableOrphan(ctx, job.ID, job.ProcessorID, job.Epoch, ownerAlive, true); err != nil {
+		logger.Error(err, "Reconciler: failed to requeue resumable orphan")
+		result.Errors++
+		return
+	}
+
+	logger.Info("Reconciler: resumable orphan requeued", "ownerAlive", ownerAlive)
+	result.ReEnqueued++
 }
 
 // transitionOrphan transitions an orphaned job to the given terminal status.
@@ -260,11 +332,13 @@ func (r *Reconciler) transitionOrphan(ctx context.Context, job *db.BatchItem, st
 		return
 	}
 
+	expectedResumable := false
 	updateItem := &db.BatchItem{
-		BaseIndexes:  db.BaseIndexes{ID: job.ID},
-		BaseContents: db.BaseContents{Status: updatedBytes},
-		Epoch:        job.Epoch,
-		BumpEpoch:    true,
+		BaseIndexes:       db.BaseIndexes{ID: job.ID},
+		BaseContents:      db.BaseContents{Status: updatedBytes},
+		Epoch:             job.Epoch,
+		BumpEpoch:         true,
+		ExpectedResumable: &expectedResumable,
 	}
 	if err := r.batchDB.DBUpdate(ctx, updateItem, job.Status); err != nil {
 		if errors.Is(err, db.ErrConflict) {
@@ -282,7 +356,7 @@ func (r *Reconciler) transitionOrphan(ctx context.Context, job *db.BatchItem, st
 }
 
 // reEnqueueOrphan re-enqueues an orphaned job whose SLO is still valid.
-func (r *Reconciler) reEnqueueOrphan(ctx context.Context, job *db.BatchItem, result *Result, logger logr.Logger) {
+func (r *Reconciler) reEnqueueOrphan(ctx context.Context, job *db.BatchItem, expectedStatus openai.BatchStatus, result *Result, logger logr.Logger) {
 	if job.Priority <= 0 {
 		logger.Error(fmt.Errorf("missing priority"), "Reconciler: cannot re-enqueue orphan without priority")
 		result.Errors++
@@ -298,12 +372,20 @@ func (r *Reconciler) reEnqueueOrphan(ctx context.Context, job *db.BatchItem, res
 	}
 
 	task := &db.BatchJobPriority{
-		ID:  job.ID,
-		SLO: slo,
+		ID:             job.ID,
+		SLO:            slo,
+		Epoch:          job.Epoch,
+		ProcessorID:    job.ProcessorID,
+		ExpectedStatus: string(expectedStatus),
 	}
 	if err := r.queue.PQEnqueue(ctx, task); err != nil {
-		logger.Error(err, "Reconciler: failed to re-enqueue orphan")
-		result.Errors++
+		if errors.Is(err, db.ErrConflict) {
+			logger.Info("Reconciler: conflict during orphan re-enqueue")
+			result.Conflicts++
+		} else {
+			logger.Error(err, "Reconciler: failed to re-enqueue orphan")
+			result.Errors++
+		}
 		return
 	}
 

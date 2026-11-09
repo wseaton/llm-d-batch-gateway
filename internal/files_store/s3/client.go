@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -31,6 +33,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
 	fsio "github.com/llm-d/llm-d-batch-gateway/internal/files_store/io"
@@ -44,7 +47,9 @@ const (
 type s3API interface {
 	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 	HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
+	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	DeleteObjects(ctx context.Context, params *s3.DeleteObjectsInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error)
 	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
 	CreateBucket(ctx context.Context, params *s3.CreateBucketInput, optFns ...func(*s3.Options)) (*s3.CreateBucketOutput, error)
 	HeadBucket(ctx context.Context, params *s3.HeadBucketInput, optFns ...func(*s3.Options)) (*s3.HeadBucketOutput, error)
@@ -209,9 +214,19 @@ func (c *Client) Store(ctx context.Context, fileName, folderName string, fileSiz
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
 		Body:   countingReader,
+		// Conditional create: fail instead of overwriting an object that
+		// appeared after the HeadObject check, so the create-only contract
+		// holds even when two writers race. The uploader carries the
+		// condition onto CompleteMultipartUpload for large bodies.
+		IfNoneMatch: aws.String("*"),
 	})
 	if err != nil {
+		// This SDK version surfaces the 412 only as an error code, not a
+		// typed error.
+		var apiErr smithy.APIError
 		switch {
+		case errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed":
+			return nil, fmt.Errorf("%w: %s", api.ErrFileExists, key)
 		case errors.Is(err, api.ErrFileTooLarge):
 			return nil, api.ErrFileTooLarge
 		case errors.Is(err, api.ErrTooManyLines):
@@ -232,6 +247,121 @@ func (c *Client) Store(ctx context.Context, fileName, folderName string, fileSiz
 		"bucket", c.bucket, "key", key, "size", metadata.Size, "lines", metadata.LinesNumber)
 
 	return metadata, nil
+}
+
+// errStreamAborted is the body-read error that aborts an in-flight upload.
+var errStreamAborted = errors.New("stream aborted")
+
+// OpenStream opens a streaming write to S3. The upload runs under the
+// context passed here: cancelling it fails subsequent writes. The bytes
+// stream straight to the destination key with If-None-Match: *, which the
+// uploader carries onto the PutObject of a small body and the
+// CompleteMultipartUpload of a large one, so the object appears only when
+// the returned StreamWriter is committed and only if no other writer
+// published first.
+func (c *Client) OpenStream(ctx context.Context, fileName, folderName string) (api.StreamWriter, error) {
+	key := c.buildKey(folderName, fileName)
+
+	_, err := c.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	})
+	if err == nil {
+		return nil, fmt.Errorf("%w: %s", api.ErrFileExists, key)
+	}
+
+	var notFound *types.NotFound
+	if !errors.As(err, &notFound) {
+		return nil, err
+	}
+
+	pr, pw := io.Pipe()
+	w := &s3StreamWriter{
+		pw:     pw,
+		done:   make(chan error, 1),
+		bucket: c.bucket,
+		key:    key,
+	}
+	go func() {
+		_, uploadErr := c.uploader.Upload(ctx, &s3.PutObjectInput{
+			Bucket:      aws.String(c.bucket),
+			Key:         aws.String(key),
+			Body:        pr,
+			IfNoneMatch: aws.String("*"),
+		})
+		// Unblock a writer stuck in Write now that the upload stopped
+		// reading (e.g. the context was cancelled).
+		_ = pr.CloseWithError(uploadErr)
+		w.done <- uploadErr
+	}()
+
+	return w, nil
+}
+
+// s3StreamWriter pipes writes into a conditional S3 upload of the destination
+// key. The upload cannot finish before Commit closes the pipe, and the
+// manager.Uploader aborts its parts when the body read fails, so an Abort
+// leaves no object behind.
+type s3StreamWriter struct {
+	pw     *io.PipeWriter
+	done   chan error
+	mu     sync.Mutex
+	bucket string
+	key    string
+	bytes  int64
+}
+
+var _ api.StreamWriter = (*s3StreamWriter)(nil)
+
+func (w *s3StreamWriter) Write(p []byte) (int, error) {
+	n, err := w.pw.Write(p)
+	w.bytes += int64(n)
+	return n, err
+}
+
+func (w *s3StreamWriter) Commit(ctx context.Context) (*api.BatchFileMetadata, error) {
+	if err := w.pw.Close(); err != nil {
+		return nil, err
+	}
+	if err := w.result(); err != nil {
+		// This SDK version surfaces the 412 only as an error code, not a
+		// typed error.
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed" {
+			return nil, fmt.Errorf("%w: %s", api.ErrFileExists, w.key)
+		}
+		return nil, err
+	}
+
+	logr.FromContextOrDiscard(ctx).V(logging.INFO).Info("File streamed successfully",
+		"bucket", w.bucket, "key", w.key, "size", w.bytes)
+
+	return &api.BatchFileMetadata{
+		Location: w.key,
+		Size:     w.bytes,
+		ModTime:  time.Now(),
+	}, nil
+}
+
+func (w *s3StreamWriter) Abort(_ context.Context) error {
+	// Failing the body read aborts the upload.
+	_ = w.pw.CloseWithError(errStreamAborted)
+	_ = w.result()
+	return nil
+}
+
+// result consumes the upload outcome exactly once: the goroutine sends a
+// single value and never closes the channel, so a second receive — Commit
+// followed by the caller's cleanup Abort — would block forever.
+func (w *s3StreamWriter) result() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.done == nil {
+		return errStreamAborted
+	}
+	err := <-w.done
+	w.done = nil
+	return err
 }
 
 // Retrieve retrieves a file from S3.
@@ -295,6 +425,68 @@ func (c *Client) Delete(ctx context.Context, fileName, folderName string) error 
 		"bucket", c.bucket, "key", key)
 
 	return nil
+}
+
+// deleteObjectsBatchLimit is S3's maximum number of keys per DeleteObjects
+// call.
+const deleteObjectsBatchLimit = 1000
+
+// DeletePrefix deletes every object under folderName/prefix and returns the
+// number of deleted objects. A prefix with no stored objects is a no-op.
+func (c *Client) DeletePrefix(ctx context.Context, folderName, prefix string) (int, error) {
+	if folderName == "" {
+		return 0, fmt.Errorf("folderName must not be empty")
+	}
+	if prefix == "" {
+		return 0, fmt.Errorf("prefix must not be empty")
+	}
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	keyPrefix := c.buildKey(folderName, prefix)
+
+	logger := logr.FromContextOrDiscard(ctx).V(logging.INFO)
+	var deleted int
+	var token *string
+	for {
+		out, err := c.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(c.bucket),
+			Prefix:            aws.String(keyPrefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return deleted, err
+		}
+
+		objects := make([]types.ObjectIdentifier, 0, len(out.Contents))
+		for _, obj := range out.Contents {
+			if obj.Key != nil {
+				objects = append(objects, types.ObjectIdentifier{Key: obj.Key})
+			}
+		}
+		for start := 0; start < len(objects); start += deleteObjectsBatchLimit {
+			end := min(start+deleteObjectsBatchLimit, len(objects))
+			del, err := c.s3Client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				Bucket: aws.String(c.bucket),
+				Delete: &types.Delete{Objects: objects[start:end], Quiet: aws.Bool(true)},
+			})
+			if err != nil {
+				return deleted, err
+			}
+			for _, e := range del.Errors {
+				logger.Info("Failed to delete object", "key", *e.Key, "message", *e.Message)
+			}
+			deleted += end - start - len(del.Errors)
+		}
+
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+
+	logger.Info("Prefix deleted", "bucket", c.bucket, "prefix", keyPrefix, "objects", deleted)
+	return deleted, nil
 }
 
 // GetContext returns a derived context with a timeout.

@@ -14,14 +14,13 @@ IMAGE_TAG="${IMAGE_TAG:-0.0.1}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
 POSTGRESQL_PASSWORD="${POSTGRESQL_PASSWORD:-postgres}"
 INFERENCE_API_KEY="${INFERENCE_API_KEY:-dummy-api-key}"
-S3_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:-minioadmin}"
+S3_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:-s3secret}"
 FILE_CLIENT_TYPE="${FILE_CLIENT_TYPE:-s3}"
 DB_CLIENT_TYPE="${DB_CLIENT_TYPE:-postgresql}"
-MINIO_IMAGE="${MINIO_IMAGE:-${IMAGE_REGISTRY}/minio/minio:latest}"
-MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-minioadmin}"
-MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-minioadmin}"
-MINIO_REGION="${MINIO_REGION:-us-east-1}"
-MINIO_BUCKET="${MINIO_BUCKET:-llm-d-batch-gateway}"
+SEAWEEDFS_IMAGE="${SEAWEEDFS_IMAGE:-ghcr.io/chrislusf/seaweedfs:4.47}"
+S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
+S3_REGION="${S3_REGION:-us-east-1}"
+S3_BUCKET="${S3_BUCKET:-llm-d-batch-gateway}"
 VLLM_SIM_MODEL="${VLLM_SIM_MODEL:-sim-model}"
 VLLM_SIM_B_MODEL="${VLLM_SIM_B_MODEL:-sim-model-b}"
 # Inference backend: vllm-vcr (the real vLLM Rust frontend over a simulated
@@ -42,7 +41,7 @@ GC_METRICS_PORT="${GC_METRICS_PORT:-9091}"
 JAEGER_NODE_PORT="${JAEGER_NODE_PORT:-30086}"
 PROMETHEUS_NODE_PORT="${PROMETHEUS_NODE_PORT:-30091}"
 GRAFANA_NODE_PORT="${GRAFANA_NODE_PORT:-30030}"
-MINIO_NODE_PORT="${MINIO_NODE_PORT:-30009}"
+SEAWEEDFS_NODE_PORT="${SEAWEEDFS_NODE_PORT:-30009}"
 APISERVER_IMG="${APISERVER_IMG:-ghcr.io/llm-d/batch-gateway-apiserver:${IMAGE_TAG}}"
 PROCESSOR_IMG="${PROCESSOR_IMG:-ghcr.io/llm-d/batch-gateway-processor:${IMAGE_TAG}}"
 GC_IMG="${GC_IMG:-ghcr.io/llm-d/batch-gateway-gc:${IMAGE_TAG}}"
@@ -50,29 +49,38 @@ GC_IMG="${GC_IMG:-ghcr.io/llm-d/batch-gateway-gc:${IMAGE_TAG}}"
 # USE_KIND=false → use existing kubeconfig context (OpenShift / Kubernetes)
 USE_KIND="${USE_KIND:-true}"
 
-# ── GIE (Gateway API Inference Extension) flow control support ────────────────
-# Set ENABLE_GIE=true to deploy per-model EPP (standalone mode) in front of
+# ── Router EPP flow control support ───────────────────────────────────────────
+# Set ENABLE_GIE=true (legacy flag name) to deploy per-model Router EPPs
+# (standalone mode) in front of
 # each vllm-sim instance; processor routes through EPP and sends
 # x-gateway-inference-objective / x-slo-ttft-ms headers.
 #
 # Naming contract (referenced by dev-deploy, dev-clean, and e2e tests):
 #   EPP Helm release:      ${GIE_EPP_RELEASE}-${model}          e.g. epp-sim-model
 #   EPP deployment/service: ${GIE_EPP_RELEASE}-${model}-epp     e.g. epp-sim-model-epp
-#   InferencePool name:     ${GIE_EPP_RELEASE}-${model}          (created by Helm chart)
-#   InferenceObjective:     batch-sheddable-${model}             (GIE mode)
-#                           batch-sheddable                      (non-GIE mode)
+#   InferencePool name:     ${GIE_EPP_RELEASE}-${model}          (GAIE CRD)
+#   InferenceObjective:     batch-sheddable-${model}             (per-model EPP mode)
+#                           batch-sheddable                      (shared EPP mode)
 #   Managed-by label:       app.kubernetes.io/managed-by=batch-gateway-dev
 ENABLE_GIE="${ENABLE_GIE:-false}"
 
 # ── Async dispatcher (llm-d-async) support ──────────────────────────────────
-# Set ENABLE_DISPATCHER=true to deploy llm-d-async dispatcher instances
-# alongside the batch-gateway. The processor is reconfigured for async dispatch.
+# Use sync dispatch by default. Set ENABLE_DISPATCHER=true to deploy the
+# llm-d-async dev fixtures; sync dispatch is required for per-model EPPs and custom layouts.
 # Set DISPATCHER_SOURCE to a local llm-d-async checkout to build from source.
 ENABLE_DISPATCHER="${ENABLE_DISPATCHER:-false}"
-GIE_REPO="${GIE_REPO:-}"
-GIE_UPSTREAM_REPO="https://github.com/kubernetes-sigs/gateway-api-inference-extension.git"
-# Last GIE tag with standalone EPP + flow-control plugins. EPP then moved to llm-d-router.
-GIE_VERSION="${GIE_VERSION:-v1.5.0}"
+# EPP comes from the llm-d-router standalone chart. The InferencePool CRD comes
+# from GAIE; InferenceObjective and InferenceModelRewrite CRDs come from
+# llm-d-router. Chart "v0" is built from router main (llm-d.ai/v1 is only there
+# until the 1.0.0 release). TODO: switch to v1.0.0 once it is released.
+ROUTER_REPO="${ROUTER_REPO:-}"
+ROUTER_CHART_VERSION="${ROUTER_CHART_VERSION:-v0}"
+ROUTER_CRD_REF="${ROUTER_CHART_VERSION}"
+if [ "${ROUTER_CRD_REF}" = "v0" ]; then
+    ROUTER_CRD_REF="main"
+fi
+# Legacy variable name retained; this is the GAIE InferencePool CRD version.
+GIE_VERSION="${GIE_VERSION:-v1.6.2}"
 GIE_EPP_RELEASE="${GIE_EPP_RELEASE:-epp}"
 GIE_OBJECTIVE_PREFIX="${GIE_OBJECTIVE_PREFIX:-batch-sheddable}"
 
@@ -96,14 +104,47 @@ detect_container_tool() {
 
 check_prerequisites() {
     step "Checking prerequisites..."
+    case "${ENABLE_DISPATCHER}" in
+        true|false) ;;
+        *) die "ENABLE_DISPATCHER must be true or false." ;;
+    esac
+    if [ "${ENABLE_DISPATCHER}" = "true" ]; then
+        if [ "${ENABLE_GIE}" = "true" ]; then
+            die "ENABLE_GIE=true cannot be combined with ENABLE_DISPATCHER=true. Use 'make dev-deploy-gie' or ENABLE_DISPATCHER=false ENABLE_GIE=true make dev-deploy for sync Router EPP."
+        fi
+        # These restrictions belong to the fixed dev/E2E fixtures, not the chart.
+        local setting
+        for setting in USE_KIND=true NAMESPACE=default EXCHANGE_CLIENT_TYPE=redis \
+            REDIS_RELEASE=redis VLLM_SIM_NAME=vllm-sim VLLM_SIM_B_NAME=vllm-sim-b \
+            VLLM_SIM_MODEL=sim-model VLLM_SIM_B_MODEL=sim-model-b \
+            JAEGER_NAME=jaeger PROMETHEUS_NAME=prometheus; do
+            local name="${setting%%=*}" expected="${setting#*=}"
+            if [ "${!name}" != "${expected}" ]; then
+                die "Async dev fixtures require ${setting} (got ${!name}). Set ENABLE_DISPATCHER=false for explicit sync deployment with custom settings."
+            fi
+        done
+        if [ "${KIND_EXPERIMENTAL_PROVIDER:-docker}" != "docker" ]; then
+            die "Async dev image loading requires Docker-backed kind. Set ENABLE_DISPATCHER=false for sync deployment with another provider."
+        fi
+        if [ -n "${DISPATCHER_SOURCE:-}" ] && [ ! -f "${DISPATCHER_SOURCE}/charts/llm-d-async/Chart.yaml" ]; then
+            die "DISPATCHER_SOURCE must contain charts/llm-d-async/Chart.yaml. Fix the checkout path or set ENABLE_DISPATCHER=false for sync deployment."
+        fi
+    fi
     local missing=()
-    for cmd in kubectl helm kind make; do
+    local required=(kubectl helm kind make)
+    if [ "${ENABLE_DISPATCHER}" = "true" ]; then
+        required+=(jq nc docker)
+    fi
+    for cmd in "${required[@]}"; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [ ${#missing[@]} -gt 0 ]; then
-        die "Missing required tools: ${missing[*]}. Please install them first."
+        die "Missing required tools: ${missing[*]}. Please install them first. Async dev additionally checks jq, nc, and docker; opt out with ENABLE_DISPATCHER=false for sync."
     fi
     CONTAINER_TOOL="$(detect_container_tool)"
+    if [ "${ENABLE_DISPATCHER}" = "true" ] && [ "${CONTAINER_TOOL}" != "docker" ]; then
+        die "Async dev image loading requires running Docker. Start Docker or set ENABLE_DISPATCHER=false for sync deployment."
+    fi
     log "Container tool : ${CONTAINER_TOOL}"
     log "OS / Arch      : ${OS} / ${ARCH}"
 }
@@ -143,8 +184,8 @@ nodes:
   - containerPort: ${GRAFANA_NODE_PORT}
     hostPort: ${GRAFANA_PORT}
     protocol: TCP
-  - containerPort: ${MINIO_NODE_PORT}
-    hostPort: ${MINIO_PORT}
+  - containerPort: ${SEAWEEDFS_NODE_PORT}
+    hostPort: ${S3_STORAGE_HOST_PORT}
     protocol: TCP
   - containerPort: ${REDIS_NODE_PORT:-30479}
     hostPort: ${REDIS_PORT:-6399}
@@ -372,13 +413,13 @@ EOF
     log "PVC '${FILES_PVC_NAME}' created."
 }
 
-# ── MinIO (S3-compatible object storage) ─────────────────────────────────────
+# ── SeaweedFS (S3-compatible object storage) ──────────────────────────────────
 
-install_minio() {
-    step "Installing MinIO '${MINIO_NAME}'..."
+install_seaweedfs() {
+    step "Installing SeaweedFS '${SEAWEEDFS_NAME}'..."
 
-    if kubectl get deployment "${MINIO_NAME}" -n "${NAMESPACE}" &>/dev/null; then
-        log "MinIO '${MINIO_NAME}' already exists. Skipping."
+    if kubectl get deployment "${SEAWEEDFS_NAME}" -n "${NAMESPACE}" &>/dev/null; then
+        log "SeaweedFS '${SEAWEEDFS_NAME}' already exists. Skipping."
         return
     fi
 
@@ -386,60 +427,57 @@ install_minio() {
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ${MINIO_NAME}
+  name: ${SEAWEEDFS_NAME}
   namespace: ${NAMESPACE}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: ${MINIO_NAME}
+      app: ${SEAWEEDFS_NAME}
   template:
     metadata:
       labels:
-        app: ${MINIO_NAME}
+        app: ${SEAWEEDFS_NAME}
     spec:
       containers:
-      - name: minio
-        image: ${MINIO_IMAGE}
-        args: ["server", "/data", "--console-address", ":9001"]
+      - name: seaweedfs
+        image: ${SEAWEEDFS_IMAGE}
+        # -admin.port: mini still allocates the admin port (gRPC = port+10000) even with -admin.ui=false;
+        # the default 23646/33646 can collide with the Linux ephemeral port range.
+        args: ["mini", "-dir=/data", "-s3.port=${SEAWEEDFS_S3_PORT}", "-webdav=false", "-admin.ui=false", "-admin.port=12646", "-s3.port.iceberg=0", "-s3.port.lance=0"]
         env:
-        - name: MINIO_ROOT_USER
-          value: "${MINIO_ACCESS_KEY}"
-        - name: MINIO_ROOT_PASSWORD
-          value: "${MINIO_SECRET_KEY}"
+        - name: AWS_ACCESS_KEY_ID
+          value: "${S3_ACCESS_KEY}"
+        - name: AWS_SECRET_ACCESS_KEY
+          value: "${S3_SECRET_ACCESS_KEY}"
         ports:
-        - containerPort: 9000
-          name: api
-        - containerPort: 9001
-          name: console
+        - containerPort: ${SEAWEEDFS_S3_PORT}
+          name: s3
         readinessProbe:
           httpGet:
-            path: /minio/health/ready
-            port: 9000
+            path: /healthz
+            port: s3
           initialDelaySeconds: 5
           periodSeconds: 5
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: ${MINIO_NAME}
+  name: ${SEAWEEDFS_NAME}
   namespace: ${NAMESPACE}
 spec:
   selector:
-    app: ${MINIO_NAME}
+    app: ${SEAWEEDFS_NAME}
   ports:
-  - name: api
-    port: 9000
-    targetPort: 9000
-  - name: console
-    port: 9001
-    targetPort: 9001
+  - name: s3
+    port: ${SEAWEEDFS_S3_PORT}
+    targetPort: ${SEAWEEDFS_S3_PORT}
 EOF
 
-    log "Waiting for MinIO to be ready..."
-    kubectl rollout status deployment "${MINIO_NAME}" -n "${NAMESPACE}" --timeout=120s
+    log "Waiting for SeaweedFS to be ready..."
+    kubectl rollout status deployment "${SEAWEEDFS_NAME}" -n "${NAMESPACE}" --timeout=120s
 
-    log "MinIO installed."
+    log "SeaweedFS installed."
 }
 
 # ── Jaeger (OpenTelemetry collector & trace UI) ──────────────────────────────
@@ -919,105 +957,99 @@ EOF
     log "vllm-vcr installed. Service: ${sim_name}:8000 (control API :${VLLM_SIM_CONTROL_PORT})"
 }
 
-# ── GIE (Gateway API Inference Extension) ────────────────────────────────────
-
-ensure_gie_repo() {
-    if [ -n "${GIE_REPO}" ] && [ -d "${GIE_REPO}" ]; then
-        log "Using user-provided GIE repo at ${GIE_REPO}"
-    else
-        log "Cloning ${GIE_UPSTREAM_REPO} at ${GIE_VERSION}..."
-        GIE_REPO="$(mktemp -d)/gateway-api-inference-extension"
-        GIE_REPO_TMPDIR="$(dirname "${GIE_REPO}")"
-        git clone --depth 1 --branch "${GIE_VERSION}" "${GIE_UPSTREAM_REPO}" "${GIE_REPO}"
-        log "Cloned GIE repo to ${GIE_REPO}"
-    fi
-
-    if [ ! -f "${GIE_REPO}/config/charts/standalone/Chart.yaml" ]; then
-        die "GIE repo at ${GIE_REPO} does not contain config/charts/standalone/Chart.yaml"
-    fi
-}
+# ── Router EPP and GAIE InferencePool support ─────────────────────────────────
 
 install_gie_crds() {
-    step "Installing GIE CRDs..."
-    kubectl apply -f "${GIE_REPO}/config/crd/bases/"
-    log "GIE CRDs installed."
+    step "Installing InferencePool, InferenceObjective and InferenceModelRewrite CRDs..."
+    local router_crd_base="https://raw.githubusercontent.com/llm-d/llm-d-router/${ROUTER_CRD_REF}/config/crd/bases"
+    if [ -n "${ROUTER_REPO}" ]; then
+        router_crd_base="${ROUTER_REPO}/config/crd/bases"
+    fi
+    kubectl apply -f "https://raw.githubusercontent.com/kubernetes-sigs/gateway-api-inference-extension/${GIE_VERSION}/config/crd/bases/inference.networking.k8s.io_inferencepools.yaml"
+    kubectl apply -f "${router_crd_base}/llm-d.ai_inferenceobjectives.yaml"
+    kubectl apply -f "${router_crd_base}/llm-d.ai_inferencemodelrewrites.yaml"
+    kubectl wait --for=condition=established crd/inferencepools.inference.networking.k8s.io \
+        crd/inferenceobjectives.llm-d.ai crd/inferencemodelrewrites.llm-d.ai --timeout=60s
+    log "CRDs installed."
 }
 
 install_gie_epp() {
     local sim_name="$1"
     local sim_model="$2"
     local release_name="${GIE_EPP_RELEASE}-${sim_model}"
-    step "Installing GIE EPP (standalone) for model '${sim_model}'..."
+    step "Installing router EPP (standalone) for model '${sim_model}'..."
 
-    local chart_dir="${GIE_REPO}/config/charts/standalone"
-    step "Building Helm dependencies for standalone chart..."
-    rm -rf "${chart_dir}/charts"
-    helm dependency build "${chart_dir}"
+    local chart_ref="oci://ghcr.io/llm-d/charts/llm-d-router-standalone"
+    local chart_args=(--version "${ROUTER_CHART_VERSION}")
+    if [ -n "${ROUTER_REPO}" ]; then
+        chart_ref="${ROUTER_REPO}/config/charts/llm-d-router-standalone"
+        chart_args=()
+        step "Building Helm dependencies for standalone chart..."
+        rm -f "${chart_ref}/Chart.lock"
+        rm -rf "${chart_ref}/charts"
+        helm dependency build "${chart_ref}"
+    fi
 
     local values_file
     values_file="$(mktemp)"
     cat > "${values_file}" <<'VALUESEOF'
-inferenceExtension:
-  pluginsCustomConfig:
-    flow-control-plugins.yaml: |
-      apiVersion: inference.networking.x-k8s.io/v1alpha1
-      kind: EndpointPickerConfig
-      featureGates:
-        - "flowControl"
-      plugins:
-        - type: round-robin-fairness-policy
-        - type: global-strict-fairness-policy
-        - type: slo-deadline-ordering-policy
-        - type: utilization-detector
-          parameters:
-            queueDepthThreshold: 1
-            kvCacheUtilThreshold: 0.8
-      flowControl:
-        maxBytes: 4294967296
-        defaultRequestTTL: 30s
-        priorityBands:
-          - priority: 100
-            maxBytes: 1073741824
-            fairnessPolicyRef: round-robin-fairness-policy
-            orderingPolicyRef: fcfs-ordering-policy
-          - priority: -1
-            maxBytes: 3221225472
+router:
+  epp:
+    pluginsConfigFile: "flow-control-plugins.yaml"
+    pluginsCustomConfig:
+      flow-control-plugins.yaml: |
+        apiVersion: llm-d.ai/v1
+        kind: EndpointPickerConfig
+        featureGates:
+          - "flowControl"
+        plugins:
+          - type: round-robin-fairness-policy
+          - type: global-strict-fairness-policy
+          - type: slo-deadline-ordering-policy
+          - type: utilization-detector
+            parameters:
+              queueDepthThreshold: 1
+              kvCacheUtilThreshold: 0.8
+        flowControl:
+          maxBytes: 4294967296
+          defaultRequestTTL: 30s
+          priorityBands:
+            - priority: 100
+              maxBytes: 1073741824
+              fairnessPolicyRef: round-robin-fairness-policy
+              orderingPolicyRef: fcfs-ordering-policy
+            - priority: -1
+              maxBytes: 3221225472
+              fairnessPolicyRef: global-strict-fairness-policy
+              orderingPolicyRef: slo-deadline-ordering-policy
+          defaultPriorityBand:
+            maxBytes: 536870912
             fairnessPolicyRef: global-strict-fairness-policy
-            orderingPolicyRef: slo-deadline-ordering-policy
-        defaultPriorityBand:
-          maxBytes: 536870912
-          fairnessPolicyRef: global-strict-fairness-policy
-          orderingPolicyRef: fcfs-ordering-policy
-      saturationDetector:
-        pluginRef: utilization-detector
+            orderingPolicyRef: fcfs-ordering-policy
+          saturationDetector:
+            pluginRef: utilization-detector
 VALUESEOF
 
+    # The Envoy ConfigMap name is fixed by default, so give each release its own.
     local helm_args=(
         --namespace "${NAMESPACE}"
-        --set "inferenceExtension.image.tag=${GIE_VERSION}"
-        --set inferenceExtension.monitoring.prometheus.auth.enabled=false
-        --set inferenceExtension.sidecar.enabled=true
-        --set "inferenceExtension.sidecar.configMap.name=envoy-${sim_model}"
-        --set "inferenceExtension.sidecar.volumes[0].name=config"
-        --set "inferenceExtension.sidecar.volumes[0].configMap.name=envoy-${sim_model}"
-        --set inferenceExtension.sidecar.proxyType=envoy
-        --set inferenceExtension.endpointsServer.createInferencePool=true
-        --set "inferencePool.modelServers.matchLabels.app=${sim_name}"
-        --set "inferencePool.targetPorts[0].number=8000"
-        --set inferencePool.modelServerType=vllm
-        --set inferenceExtension.pluginsConfigFile=flow-control-plugins.yaml
-        --set inferenceExtension.resources.requests.cpu=100m
-        --set inferenceExtension.resources.requests.memory=256Mi
-        --set inferenceExtension.resources.limits.memory=512Mi
-        --set "inferenceExtension.flags.zap-log-level=${LOG_VERBOSITY}"
+        --set router.monitoring.prometheus.auth.enabled=false
+        --set "router.proxy.presets.envoy.configMap.name=envoy-${sim_model}"
+        --set "router.modelServers.matchLabels.app=${sim_name}"
+        --set router.epp.resources.requests.cpu=100m
+        --set router.epp.resources.requests.memory=256Mi
+        --set router.epp.resources.limits.memory=512Mi
+        --set router.proxy.resources.requests.cpu=100m
+        --set router.proxy.resources.requests.memory=128Mi
+        --set "router.epp.flags.v=${LOG_VERBOSITY}"
         -f "${values_file}"
     )
 
     if helm status "${release_name}" -n "${NAMESPACE}" &>/dev/null; then
         log "EPP release '${release_name}' already exists. Upgrading..."
-        helm upgrade "${release_name}" "${chart_dir}" "${helm_args[@]}"
+        helm upgrade "${release_name}" "${chart_ref}" ${chart_args[@]+"${chart_args[@]}"} "${helm_args[@]}"
     else
-        helm install "${release_name}" "${chart_dir}" "${helm_args[@]}"
+        helm install "${release_name}" "${chart_ref}" ${chart_args[@]+"${chart_args[@]}"} "${helm_args[@]}"
     fi
     rm -f "${values_file}"
 
@@ -1026,12 +1058,12 @@ VALUESEOF
 }
 
 create_inference_objectives() {
-    step "Creating InferenceObjective CRDs..."
+    step "Creating InferenceObjectives..."
 
     for sim_model in "${VLLM_SIM_MODEL}" "${VLLM_SIM_B_MODEL}"; do
         local pool_name="${GIE_EPP_RELEASE}-${sim_model}"
         kubectl apply -f - <<EOF
-apiVersion: inference.networking.x-k8s.io/v1alpha2
+apiVersion: llm-d.ai/v1
 kind: InferenceObjective
 metadata:
   name: interactive-default-${sim_model}
@@ -1040,11 +1072,11 @@ metadata:
     app.kubernetes.io/managed-by: batch-gateway-dev
 spec:
   priority: 100
-  poolRef:
-    group: inference.networking.k8s.io
-    name: ${pool_name}
+  poolRefs:
+    - group: inference.networking.k8s.io
+      name: ${pool_name}
 ---
-apiVersion: inference.networking.x-k8s.io/v1alpha2
+apiVersion: llm-d.ai/v1
 kind: InferenceObjective
 metadata:
   name: ${GIE_OBJECTIVE_PREFIX}-${sim_model}
@@ -1053,9 +1085,9 @@ metadata:
     app.kubernetes.io/managed-by: batch-gateway-dev
 spec:
   priority: -1
-  poolRef:
-    group: inference.networking.k8s.io
-    name: ${pool_name}
+  poolRefs:
+    - group: inference.networking.k8s.io
+      name: ${pool_name}
 EOF
     done
 
@@ -1072,7 +1104,7 @@ install_batch_gateway() {
     if [ "${ENABLE_GIE}" = "true" ]; then
         vllm_sim_url="http://${GIE_EPP_RELEASE}-${VLLM_SIM_MODEL}-epp.${NAMESPACE}.svc.cluster.local:8081"
         vllm_sim_b_url="http://${GIE_EPP_RELEASE}-${VLLM_SIM_B_MODEL}-epp.${NAMESPACE}.svc.cluster.local:8081"
-        log "GIE enabled: routing both models through per-model EPP instances"
+        log "Router EPP mode enabled: routing both models through per-model EPP instances"
     else
         vllm_sim_url="http://${VLLM_SIM_NAME}.${NAMESPACE}.svc.cluster.local:8000"
         vllm_sim_b_url="http://${VLLM_SIM_B_NAME}.${NAMESPACE}.svc.cluster.local:8000"
@@ -1087,18 +1119,6 @@ install_batch_gateway() {
         --set "processor.image.tag=${IMAGE_TAG}"
         --set "global.fileClient.type=${FILE_CLIENT_TYPE}"
         --set "global.secretName=${APP_SECRET_NAME}"
-        --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.url=${vllm_sim_url}"
-        --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.requestTimeout=5m"
-        --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.maxRetries=3"
-        --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.initialBackoff=1s"
-        --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.maxBackoff=60s"
-        --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.url=${vllm_sim_b_url}"
-        --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.requestTimeout=5m"
-        --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.maxRetries=3"
-        --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.initialBackoff=1s"
-        --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.maxBackoff=60s"
-        --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.inferenceObjective=${GIE_OBJECTIVE_PREFIX}"
-        --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.inferenceObjective=${GIE_OBJECTIVE_PREFIX}"
         --set "processor.logging.verbosity=${LOG_VERBOSITY}"
         --set "apiserver.logging.verbosity=${LOG_VERBOSITY}"
         --set "apiserver.config.batchAPI.passThroughHeaders={X-E2E-Pass-Through-1,X-E2E-Pass-Through-2}"
@@ -1122,14 +1142,35 @@ install_batch_gateway() {
         --namespace "${NAMESPACE}"
     )
 
+    if [ "${ENABLE_DISPATCHER}" = "true" ]; then
+        helm_args+=(--values "${REPO_ROOT}/test/e2e/dispatcher/processor-async-values.yaml")
+    else
+        helm_args+=(
+            --set processor.config.dispatchMode=sync
+            --set processor.config.asyncDispatch=null
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.url=${vllm_sim_url}"
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.requestTimeout=5m"
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.maxRetries=3"
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.initialBackoff=1s"
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.maxBackoff=60s"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.url=${vllm_sim_b_url}"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.requestTimeout=5m"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.maxRetries=3"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.initialBackoff=1s"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.maxBackoff=60s"
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.inferenceObjective=${GIE_OBJECTIVE_PREFIX}"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.inferenceObjective=${GIE_OBJECTIVE_PREFIX}"
+        )
+    fi
+
     # Add file client specific helm args
     if [ "${FILE_CLIENT_TYPE}" = "s3" ]; then
-        local minio_endpoint="http://${MINIO_NAME}.${NAMESPACE}.svc.cluster.local:9000"
+        local s3_endpoint="http://${SEAWEEDFS_NAME}.${NAMESPACE}.svc.cluster.local:${SEAWEEDFS_S3_PORT}"
         helm_args+=(
-            --set "global.fileClient.s3.region=${MINIO_REGION}"
-            --set "global.fileClient.s3.bucket=${MINIO_BUCKET}"
-            --set "global.fileClient.s3.endpoint=${minio_endpoint}"
-            --set "global.fileClient.s3.accessKeyId=${MINIO_ACCESS_KEY}"
+            --set "global.fileClient.s3.region=${S3_REGION}"
+            --set "global.fileClient.s3.bucket=${S3_BUCKET}"
+            --set "global.fileClient.s3.endpoint=${s3_endpoint}"
+            --set "global.fileClient.s3.accessKeyId=${S3_ACCESS_KEY}"
             --set "global.fileClient.s3.usePathStyle=true"
             --set "global.fileClient.s3.autoCreateBucket=true"
         )
@@ -1153,7 +1194,7 @@ install_batch_gateway() {
 
     if helm status "${HELM_RELEASE}" -n "${NAMESPACE}" &>/dev/null; then
         log "Release '${HELM_RELEASE}' already exists. Upgrading..."
-        helm upgrade "${HELM_RELEASE}" ./charts/batch-gateway "${helm_args[@]}"
+        helm upgrade "${HELM_RELEASE}" ./charts/batch-gateway --reset-values "${helm_args[@]}"
         # Force pod restart so the newly-loaded container images are picked up.
         # helm upgrade alone won't recreate pods when only the image contents
         # changed but the tag (e.g. 0.0.1) stayed the same.
@@ -1327,17 +1368,17 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: ${MINIO_NAME}-nodeport
+  name: ${SEAWEEDFS_NAME}-nodeport
 spec:
   type: NodePort
   selector:
-    app: ${MINIO_NAME}
+    app: ${SEAWEEDFS_NAME}
   ports:
-  - name: api
+  - name: s3
     protocol: TCP
-    port: 9000
-    targetPort: 9000
-    nodePort: ${MINIO_NODE_PORT}
+    port: ${SEAWEEDFS_S3_PORT}
+    targetPort: ${SEAWEEDFS_S3_PORT}
+    nodePort: ${SEAWEEDFS_NODE_PORT}
 ---
 apiVersion: v1
 kind: Service
@@ -1388,7 +1429,7 @@ print_usage() {
     echo "       - sim-model-b   (vllm-vcr at ${VLLM_SIM_B_NAME}, control API :${VLLM_SIM_CONTROL_PORT})"
     if [ "${ENABLE_GIE}" = "true" ]; then
     echo ""
-    echo "     GIE (flow control) is enabled:"
+    echo "     EPP flow control is enabled:"
     echo "       - Requests route through per-model EPP instances"
     echo "       - Each model has its own InferencePool and InferenceObjective"
     echo "       - InferenceObjectives: interactive-default (priority 100), ${GIE_OBJECTIVE_PREFIX} (priority -1)"
@@ -1398,6 +1439,10 @@ print_usage() {
     echo "     Async dispatcher is enabled:"
     echo "       - Processor is configured for async dispatch via llm-d-async"
     echo "       - Run dispatcher tests: ENABLE_DISPATCHER=true make test-e2e"
+    else
+    echo ""
+    echo "     Sync dispatch is enabled (default)."
+    echo "       - Deploy async fixtures with: ENABLE_DISPATCHER=true make dev-deploy"
     fi
     echo ""
     echo "  3. Create a batch (replace FILE_ID with the id from step 2):"
@@ -1474,9 +1519,9 @@ main() {
     install_postgresql
     create_secret
     create_tls_secret
-    # MinIO is always installed so that S3 integration tests can run
+    # SeaweedFS is always installed so that S3 integration tests can run
     # against the dev cluster regardless of the batch file client type.
-    install_minio
+    install_seaweedfs
     if [ "${FILE_CLIENT_TYPE}" != "s3" ]; then
         create_pvc
     fi
@@ -1487,27 +1532,24 @@ main() {
     install_vllm_sim "${VLLM_SIM_NAME}" "${VLLM_SIM_MODEL}" 50 100
     install_vllm_sim "${VLLM_SIM_B_NAME}" "${VLLM_SIM_B_MODEL}" 200 500
     if [ "${ENABLE_GIE}" = "true" ]; then
-        ensure_gie_repo
         install_gie_crds
         install_gie_epp "${VLLM_SIM_NAME}" "${VLLM_SIM_MODEL}"
         install_gie_epp "${VLLM_SIM_B_NAME}" "${VLLM_SIM_B_MODEL}"
         create_inference_objectives
-        if [ -n "${GIE_REPO_TMPDIR:-}" ]; then
-            rm -rf "${GIE_REPO_TMPDIR}"
-            log "Cleaned up cloned GIE repo at ${GIE_REPO_TMPDIR}"
-        fi
+    fi
+    if [ "${ENABLE_DISPATCHER}" = "true" ]; then
+        source "${SCRIPT_DIR}/dev-deploy-dispatcher.sh"
     fi
     install_batch_gateway
     verify_deployment
     if [ "${USE_KIND}" = true ]; then
         create_nodeport_services
     fi
-    if [ "${ENABLE_DISPATCHER}" = "true" ]; then
-        source "${SCRIPT_DIR}/dev-deploy-dispatcher.sh"
-    fi
     print_usage
 
     log "Deployment complete!"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

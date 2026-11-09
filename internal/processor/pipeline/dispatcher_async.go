@@ -2,17 +2,20 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/go-logr/logr"
 
+	"github.com/llm-d/llm-d-batch-gateway/internal/processor/batchctx"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
 
 // AsyncDispatcher submits requests to async queues (fire-and-forget).
 // Results arrive via per-model ResultBroadcasters (backed by shared
-// clients) that send directly to resultCh.
+// clients) that send directly to resultCh. The pre-dispatch ownership
+// fence lives in the PreDispatcher wrapping this dispatcher.
 type AsyncDispatcher struct {
 	resolver     *inference.AsyncGatewayResolver
 	broadcasters *BroadcasterGroup
@@ -37,7 +40,11 @@ func NewAsyncDispatcher(
 }
 
 func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem, resultCh chan<- ResultItem) error {
-	d.broadcasters.Subscribe(resultCh)
+	d.broadcasters.Subscribe(resultCh, d.pending.Has)
+	// Recovery broadcasters only begin claiming once this job is subscribed,
+	// so a delivery already sitting on a previous submitter's route routes
+	// here instead of being held for the claim lease.
+	d.broadcasters.Start()
 
 	// Submit phase — fast queue writes.
 	for msg := range requestCh {
@@ -69,22 +76,33 @@ func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem,
 	d.pending.Wait(ctx)
 
 	// Best-effort: tell the queue to drop still-pending requests before
-	// dispatch. Use a detached context — ctx is often already cancelled.
-	if ids := d.pending.IDs(); len(ids) > 0 {
-		cancelCtx, cancelFn := context.WithTimeout(context.Background(), 5*time.Second)
-		d.cancelPending(cancelCtx, ids)
-		cancelFn()
+	// dispatch — but only when the batch is aborting for good (user cancel,
+	// SLO expiry). A stop that leads to a resume (shutdown, ownership loss)
+	// must not cancel: the queue turns a marked request into a CANCELLED
+	// result, and the next incarnation, which re-submits the same stable
+	// request IDs, would checkpoint that stale result as a request failure.
+	// Leftover submissions are harmless — dispatch is at-least-once and
+	// duplicate results are dropped on commit. Use a detached context —
+	// ctx is often already cancelled.
+	if cause := batchctx.Cause(ctx); errors.Is(cause, batchctx.ErrCancelled) || errors.Is(cause, batchctx.ErrExpired) {
+		if ids := d.pending.IDs(); len(ids) > 0 {
+			cancelCtx, cancelFn := context.WithTimeout(context.Background(), 5*time.Second)
+			d.cancelPending(cancelCtx, ids)
+			cancelFn()
+		}
 	}
 
 	// Drain submitted-but-uncollected requests as errors so that
 	// output_lines + error_lines == total_requests.
+	code, message := cancelCode(ctx)
 	d.pending.DrainUnresolved(func(msg RequestItem) {
-		resultCh <- *msg.Error("batch_expired", "result not collected before deadline")
+		resultCh <- *msg.Error(code, message)
 	})
 
-	// Unsubscribe removes resultCh from the broadcast list. A concurrent
+	// Unsubscribe removes resultCh from the subscriber list. A concurrent
 	// send from the broadcaster may still race with close(resultCh);
-	// safeChannelSend recovers from the resulting panic.
+	// safeChannelSend recovers from the resulting panic and leaves the
+	// delivery unacked, so its lease redelivers it.
 	d.broadcasters.Unsubscribe(resultCh)
 	close(resultCh)
 
@@ -92,10 +110,14 @@ func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem,
 }
 
 func cancelCode(ctx context.Context) (string, string) {
-	if context.Cause(ctx) == context.DeadlineExceeded {
+	cause := context.Cause(ctx)
+	if errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, batchctx.ErrExpired) {
 		return string(batch_types.ErrCodeBatchExpired), batch_types.ErrCodeBatchExpired.Message()
 	}
-	return string(batch_types.ErrCodeBatchCancelled), batch_types.ErrCodeBatchCancelled.Message()
+	if errors.Is(cause, batchctx.ErrCancelled) {
+		return string(batch_types.ErrCodeBatchCancelled), batch_types.ErrCodeBatchCancelled.Message()
+	}
+	return string(batch_types.ErrCodeBatchFailed), batch_types.ErrCodeBatchFailed.Message()
 }
 
 // cancelPending calls Cancel on every shared client with all pending IDs.

@@ -73,7 +73,6 @@ func setupTestHandler(t *testing.T) *FileAPIHandler {
 		FileDB:    dbClient,
 		Queue:     nil,
 		Event:     nil,
-		Status:    nil,
 	}
 
 	t.Cleanup(func() { _ = filesClient.Close() })
@@ -135,9 +134,51 @@ func createTestFile(t *testing.T, handler *FileAPIHandler, ctx context.Context, 
 
 func doTestCreateFile(t *testing.T) {
 	t.Run("Success", doTestCreateFileSuccess)
+	t.Run("MissingFile", doTestCreateFileMissingFile)
 	t.Run("PurposeValidation", doTestCreateFilePurposeValidation)
 	t.Run("ExpiresAfterValidation", doTestCreateFileExpiresAfter)
 	t.Run("StoreValidationErrors", doTestCreateFileStoreValidationErrors)
+}
+
+func doTestCreateFileMissingFile(t *testing.T) {
+	for _, field := range []string{"", "file", "other_file"} {
+		t.Run("field="+field, func(t *testing.T) {
+			body := &bytes.Buffer{}
+			writer := multipart.NewWriter(body)
+			if err := writer.WriteField("purpose", "batch"); err != nil {
+				t.Fatal(err)
+			}
+			if field == "file" {
+				if err := writer.WriteField(field, "not a file part"); err != nil {
+					t.Fatal(err)
+				}
+			} else if field != "" {
+				if _, err := writer.CreateFormFile(field, "input.jsonl"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/files", body)
+			req.Header.Set("Content-Type", writer.FormDataContentType())
+			w := httptest.NewRecorder()
+			mux := http.NewServeMux()
+			common.RegisterHandler(mux, setupTestHandler(t))
+			mux.ServeHTTP(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for missing file part, got %d: %s", w.Code, w.Body.String())
+			}
+			var response openai.ErrorResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.Error.Type != "invalid_request_error" || !strings.Contains(response.Error.Message, "file") {
+				t.Errorf("expected a file validation error, got %+v", response.Error)
+			}
+		})
+	}
 }
 
 // errStoreFileClient implements fsapi.BatchFilesClient and returns a fixed error from Store.
@@ -156,6 +197,14 @@ func (c *errStoreFileClient) Retrieve(ctx context.Context, fileName, folderName 
 
 func (c *errStoreFileClient) Delete(ctx context.Context, fileName, folderName string) error {
 	return nil
+}
+
+func (c *errStoreFileClient) DeletePrefix(ctx context.Context, folderName, prefix string) (int, error) {
+	return 0, nil
+}
+
+func (c *errStoreFileClient) OpenStream(ctx context.Context, fileName, folderName string) (fsapi.StreamWriter, error) {
+	return nil, errors.New("not implemented")
 }
 
 func (c *errStoreFileClient) Close() error {
@@ -192,8 +241,7 @@ func doTestCreateFileStoreValidationErrors(t *testing.T) {
 		func(f *dbapi.FileItem) string { return f.ID },
 		func(q *dbapi.FileQuery) *dbapi.BaseQuery { return &q.BaseQuery },
 	)
-	// Use default max file size so the multipart request body is under the Content-Length
-	// pre-check; Store() errors are injected by errStoreFileClient.
+	// Keep the file below the size limit; Store() errors are injected by errStoreFileClient.
 	config := &common.ServerConfig{
 		FileAPI: common.FileAPIConfig{
 			MaxSizeBytes:             common.DefaultMaxFileSizeBytes,
@@ -258,7 +306,6 @@ func doTestCreateFileStoreValidationErrors(t *testing.T) {
 				BatchDB: nil,
 				Queue:   nil,
 				Event:   nil,
-				Status:  nil,
 			}
 			handler := NewFileAPIHandler(config, clients)
 			req := buildCreateRequest(t)
@@ -676,14 +723,18 @@ func doTestListFiles(t *testing.T) {
 
 	// Test 6: Invalid after parameter
 	t.Run("InvalidAfter", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/v1/files?after=invalid", nil)
-		req = req.WithContext(ctx)
+		for _, after := range []string{"invalid", "-1", "-9223372036854775808"} {
+			t.Run(after, func(t *testing.T) {
+				req := httptest.NewRequest(http.MethodGet, "/v1/files?after="+after, nil)
+				req = req.WithContext(ctx)
 
-		w := httptest.NewRecorder()
-		handler.ListFiles(w, req)
+				w := httptest.NewRecorder()
+				handler.ListFiles(w, req)
 
-		if w.Code != http.StatusBadRequest {
-			t.Errorf("expected status %d for invalid after, got %d", http.StatusBadRequest, w.Code)
+				if w.Code != http.StatusBadRequest {
+					t.Errorf("expected status %d for invalid after, got %d", http.StatusBadRequest, w.Code)
+				}
+			})
 		}
 	})
 
@@ -1150,4 +1201,116 @@ func doTestDeleteFile(t *testing.T) {
 			t.Fatalf("expected metadata to be deleted after ErrNotExist, got %d items", len(items))
 		}
 	})
+}
+
+func TestCreateFileSizeBoundary(t *testing.T) {
+	const limit = 1024
+	for _, chunked := range []bool{false, true} {
+		for _, size := range []int{limit - 1, limit, limit + 1} {
+			t.Run(fmt.Sprintf("chunked=%t/size=%d", chunked, size), func(t *testing.T) {
+				handler := setupTestHandler(t)
+				handler.config.FileAPI.MaxSizeBytes = limit
+				server := httptest.NewServer(http.HandlerFunc(handler.CreateFile))
+				defer server.Close()
+
+				var body bytes.Buffer
+				writer := multipart.NewWriter(&body)
+				part, err := writer.CreateFormFile("file", "input.jsonl")
+				if err != nil {
+					t.Fatal(err)
+				}
+				content := `{"input":"` + strings.Repeat("x", size-len("{\"input\":\"\"}\n")) + "\"}\n"
+				if _, err := io.WriteString(part, content); err != nil {
+					t.Fatal(err)
+				}
+				if err := writer.WriteField("purpose", "batch"); err != nil {
+					t.Fatal(err)
+				}
+				if err := writer.Close(); err != nil {
+					t.Fatal(err)
+				}
+				req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/files", &body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("Content-Type", writer.FormDataContentType())
+				if chunked {
+					req.ContentLength = -1
+				}
+				response, err := server.Client().Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer response.Body.Close()
+				wantStatus := http.StatusOK
+				if size > limit {
+					wantStatus = http.StatusBadRequest
+				}
+				if response.StatusCode != wantStatus {
+					data, _ := io.ReadAll(response.Body)
+					t.Fatalf("status = %d, want %d: %s", response.StatusCode, wantStatus, data)
+				}
+				if wantStatus == http.StatusOK {
+					var file openai.FileObject
+					if err := json.NewDecoder(response.Body).Decode(&file); err != nil {
+						t.Fatal(err)
+					}
+					if file.Bytes != int64(size) {
+						t.Errorf("file bytes = %d, want %d", file.Bytes, size)
+					}
+				}
+			})
+		}
+	}
+}
+
+type countedUploadReader struct {
+	io.Reader
+	bytesRead int64
+}
+
+func (r *countedUploadReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.bytesRead += int64(n)
+	return n, err
+}
+
+func TestCreateFileBoundsRequestBody(t *testing.T) {
+	const limit = 1024
+	for _, chunked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("chunked=%t", chunked), func(t *testing.T) {
+			handler := setupTestHandler(t)
+			handler.config.FileAPI.MaxSizeBytes = limit
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			part, err := writer.CreateFormFile("file", "large.jsonl")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(part, strings.Repeat("x", 2*maxUploadFormOverhead)); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reader := &countedUploadReader{Reader: &body}
+			req := httptest.NewRequest(http.MethodPost, "/v1/files", reader)
+			req.Header.Set("Content-Type", writer.FormDataContentType())
+			req.ContentLength = int64(body.Len())
+			if chunked {
+				req.ContentLength = -1
+			}
+			response := httptest.NewRecorder()
+			handler.CreateFile(response, req)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", response.Code, response.Body)
+			}
+			if !chunked && reader.bytesRead != 0 {
+				t.Errorf("read %d bytes from oversized known-length request", reader.bytesRead)
+			}
+			if reader.bytesRead > limit+maxUploadFormOverhead+1 {
+				t.Errorf("read %d bytes, exceeding request bound", reader.bytesRead)
+			}
+		})
+	}
 }

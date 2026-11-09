@@ -1,13 +1,65 @@
 package worker
 
 import (
+	"context"
+	"errors"
+	"slices"
 	"testing"
 
+	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/config"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/pipeline"
+	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/semaphore"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
+
+// errEpochUpdater is a stub epochProgressUpdater returning a fixed error.
+type errEpochUpdater struct{ err error }
+
+func (e errEpochUpdater) UpdateProgressCounts(context.Context, string, int64, *openai.BatchRequestCounts) error {
+	return e.err
+}
+
+func TestJobProgressUpdater_FencedOutSignalsOwnershipLost(t *testing.T) {
+	// A fenced-out progress write (ErrConflict) signals ownership loss via
+	// onFencedOut and is not propagated to the progress tracker.
+	var fencedOut bool
+	u := jobProgressUpdater{
+		inner:       errEpochUpdater{err: db.ErrConflict},
+		jobID:       "job-1",
+		epoch:       5,
+		onFencedOut: func() { fencedOut = true },
+	}
+	if err := u.UpdateProgressCounts(context.Background(), "job-1", &openai.BatchRequestCounts{Total: 1}); err != nil {
+		t.Fatalf("fenced-out write should not propagate to the tracker, got %v", err)
+	}
+	if !fencedOut {
+		t.Fatal("expected onFencedOut to be called on ErrConflict")
+	}
+
+	// A non-conflict error propagates unchanged and does not trip onFencedOut.
+	boom := errors.New("boom")
+	tripped := false
+	u2 := jobProgressUpdater{
+		inner:       errEpochUpdater{err: boom},
+		jobID:       "job-1",
+		epoch:       5,
+		onFencedOut: func() { tripped = true },
+	}
+	if err := u2.UpdateProgressCounts(context.Background(), "job-1", &openai.BatchRequestCounts{Total: 1}); !errors.Is(err, boom) {
+		t.Fatalf("expected non-conflict error to propagate, got %v", err)
+	}
+	if tripped {
+		t.Fatal("onFencedOut must not be called for a non-conflict error")
+	}
+
+	// A nil onFencedOut is safe to skip.
+	u3 := jobProgressUpdater{inner: errEpochUpdater{err: db.ErrConflict}, jobID: "job-1", epoch: 5}
+	if err := u3.UpdateProgressCounts(context.Background(), "job-1", &openai.BatchRequestCounts{Total: 1}); err != nil {
+		t.Fatalf("nil onFencedOut with ErrConflict should not error, got %v", err)
+	}
+}
 
 func TestBuildAIMDModels(t *testing.T) {
 	// Tenant-scoped gateway config, as produced when route_key_method is
@@ -121,4 +173,90 @@ func mapKeys(m map[string]*pipeline.EndpointAIMD) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// TestRecoveryPlan pins the takeover routing plan derived from a resume
+// seed: in-flight entries defer re-submission, foreign submitters get a
+// recovery broadcaster each (deduplicated), and entries this processor
+// submitted itself (same-identity restart) defer without a foreign route.
+func TestRecoveryPlan(t *testing.T) {
+	tests := []struct {
+		name           string
+		seed           *db.ResumableResumeState
+		self           string
+		canRecover     bool
+		wantRecovering []string
+		wantSubmitters []string
+	}{
+		{
+			name: "foreign submitter recovers through its route",
+			seed: &db.ResumableResumeState{InFlightSubmittedBy: map[string]string{
+				"req-1": "proc-a",
+				"req-2": "proc-a",
+			}},
+			self:           "proc-b",
+			canRecover:     true,
+			wantRecovering: []string{"req-1", "req-2"},
+			wantSubmitters: []string{"proc-a"},
+		},
+		{
+			name: "same-identity restart defers without a foreign route",
+			seed: &db.ResumableResumeState{InFlightSubmittedBy: map[string]string{
+				"req-1": "proc-a",
+			}},
+			self:           "proc-a",
+			canRecover:     true,
+			wantRecovering: []string{"req-1"},
+			wantSubmitters: nil,
+		},
+		{
+			name: "unknown submitter re-submits directly",
+			seed: &db.ResumableResumeState{InFlightSubmittedBy: map[string]string{
+				"req-1": "", // written before submitter tracking
+			}},
+			self:           "proc-b",
+			canRecover:     true,
+			wantRecovering: nil,
+			wantSubmitters: nil,
+		},
+		{
+			name:           "sync dispatch never recovers routes",
+			seed:           &db.ResumableResumeState{InFlightSubmittedBy: map[string]string{"req-1": "proc-a"}},
+			self:           "proc-b",
+			canRecover:     false,
+			wantRecovering: nil,
+			wantSubmitters: nil,
+		},
+		{
+			name: "SQL transport re-submits without recovery window",
+			seed: &db.ResumableResumeState{InFlightSubmittedBy: map[string]string{
+				"req-1": "proc-a",
+			}},
+			self:           "proc-b",
+			canRecover:     false,
+			wantRecovering: nil,
+			wantSubmitters: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recovering, submitters := recoveryPlan(tt.seed, tt.self, tt.canRecover)
+			if len(recovering) != len(tt.wantRecovering) {
+				t.Fatalf("recovering = %v, want %v", recovering, tt.wantRecovering)
+			}
+			for _, id := range tt.wantRecovering {
+				if _, ok := recovering[id]; !ok {
+					t.Fatalf("recovering = %v, want %q", recovering, id)
+				}
+			}
+			if len(submitters) != len(tt.wantSubmitters) {
+				t.Fatalf("submitters = %v, want %v", submitters, tt.wantSubmitters)
+			}
+			for _, s := range tt.wantSubmitters {
+				if !slices.Contains(submitters, s) {
+					t.Fatalf("submitters = %v, want %q", submitters, s)
+				}
+			}
+		})
+	}
 }

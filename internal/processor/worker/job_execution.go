@@ -38,6 +38,20 @@ type jobExecutionParams struct {
 
 	eventWatcher *db.BatchEventsChan
 	cancelUser   context.CancelFunc
+	// onOwnershipLost trips the abort context with the neutral cause when a
+	// fenced progress write reveals this processor lost ownership of the job.
+	// Set by runJob, invoked by the per-job progress updater.
+	onOwnershipLost func()
+
+	// resultSink, when set, routes results through the durable checkpointing
+	// pipeline instead of the legacy local-file collector. runJob installs it
+	// after resumable activation succeeds.
+	resultSink *batchResultStore
+
+	// resumeSeed, when set, carries the checkpointed entry counts of previous
+	// incarnations: executeJob seeds the progress tracker with them and
+	// skips their request IDs at the source instead of re-dispatching.
+	resumeSeed *db.ResumableResumeState
 
 	requestCounts *openai.BatchRequestCounts
 }

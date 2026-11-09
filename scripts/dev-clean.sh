@@ -10,11 +10,11 @@ source "${SCRIPT_DIR}/dev-common.sh"
 cleanup_kubernetes_resources() {
     step "Cleaning up Kubernetes resources in namespace '${NAMESPACE}'..."
 
-    # Clean up GIE EPP releases and CRDs (if any were deployed with ENABLE_GIE=true).
+    # Clean up Router EPP releases and CRDs (if deployed with ENABLE_GIE=true).
     # Uses managed-by label to scope deletion to resources created by this script.
     local epp_prefix="${GIE_EPP_RELEASE:-epp}"
     for release in $(helm list -n "${NAMESPACE}" -q --filter "^${epp_prefix}-" 2>/dev/null); do
-        log "Uninstalling GIE EPP release '${release}'..."
+        log "Uninstalling Router EPP release '${release}'..."
         helm uninstall "${release}" -n "${NAMESPACE}" || warn "Failed to uninstall EPP release '${release}'"
     done
     kubectl delete inferenceobjective -l app.kubernetes.io/managed-by=batch-gateway-dev -n "${NAMESPACE}" --ignore-not-found=true \
@@ -46,6 +46,7 @@ cleanup_kubernetes_resources() {
     kubectl delete svc "${PROMETHEUS_NAME}-nodeport" -n "${NAMESPACE}" --ignore-not-found=true
     kubectl delete svc "${GRAFANA_NAME}-nodeport" -n "${NAMESPACE}" --ignore-not-found=true
     kubectl delete svc "${JAEGER_NAME}-nodeport" -n "${NAMESPACE}" --ignore-not-found=true
+    kubectl delete svc "${SEAWEEDFS_NAME}-nodeport" -n "${NAMESPACE}" --ignore-not-found=true
 
     # Delete deployments and services
     log "Deleting deployments and services..."
@@ -57,7 +58,7 @@ cleanup_kubernetes_resources() {
     kubectl delete clusterrole,clusterrolebinding "${PROMETHEUS_NAME}" --ignore-not-found=true
     kubectl delete deployment,svc "${VLLM_SIM_NAME}" -n "${NAMESPACE}" --ignore-not-found=true
     kubectl delete deployment,svc "${VLLM_SIM_B_NAME}" -n "${NAMESPACE}" --ignore-not-found=true
-    kubectl delete deployment,svc "${MINIO_NAME}" -n "${NAMESPACE}" --ignore-not-found=true
+    kubectl delete deployment,svc "${SEAWEEDFS_NAME}" -n "${NAMESPACE}" --ignore-not-found=true
 
     # Delete e2e helper pods (created by test runs, safe to ignore if absent)
     kubectl delete pod "batch-gateway-e2e-curl" -n "${NAMESPACE}" --ignore-not-found=true

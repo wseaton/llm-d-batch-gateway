@@ -1,4 +1,8 @@
 {{- if .Values.processor.enabled -}}
+{{- $dispatchMode := default "sync" .Values.processor.config.dispatchMode -}}
+{{- if and (eq $dispatchMode "async") (empty .Values.processor.config.asyncDispatch.models) -}}
+{{- fail "processor.config.asyncDispatch.models must be configured when dispatchMode is async" -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -13,6 +17,19 @@ data:
     task_wait_time: {{ .Values.processor.config.taskWaitTime | quote }}
     poll_interval: {{ .Values.processor.config.pollInterval | quote }}
     num_workers: {{ .Values.processor.config.numWorkers }}
+    {{- $extraEndpoints := .Values.global.extraEndpoints }}
+    {{- if ne .Values.processor.config.extraEndpoints nil }}
+    {{- $extraEndpoints = .Values.processor.config.extraEndpoints }}
+    {{- end }}
+    {{- if $extraEndpoints }}
+    extra_endpoints:
+      {{- range $extraEndpoints }}
+      - {{ . | quote }}
+      {{- end }}
+    {{- end }}
+    work_dir_size_limit: {{ .Values.processor.workDirVolume.sizeLimit | quote }}
+    input_file_disk_budget_percent: {{ .Values.processor.config.inputFileDiskBudgetPercent }}
+    input_file_max_size_bytes: {{ .Values.global.maxInputFileSizeBytes | int64 }}
     concurrency:
       global: {{ .Values.processor.config.concurrency.global }}
       per_endpoint: {{ .Values.processor.config.concurrency.perEndpoint }}
@@ -29,24 +46,18 @@ data:
 
     db_client:
       type: {{ .Values.global.dbClient.type | quote }}
-      redis:
-        db: {{ .Values.global.dbClient.redis.db }}
-        enable_tls: {{ .Values.global.dbClient.redis.enableTLS }}
-        insecure: {{ .Values.global.dbClient.redis.insecure }}
-        timeout: {{ .Values.global.dbClient.redis.timeout | quote }}
-        max_retries: {{ .Values.global.dbClient.redis.maxRetries }}
-        min_retry_backoff: {{ .Values.global.dbClient.redis.minRetryBackoff | quote }}
-        max_retry_backoff: {{ .Values.global.dbClient.redis.maxRetryBackoff | quote }}
-        pool_timeout: {{ .Values.global.dbClient.redis.poolTimeout | quote }}
-        conn_max_idle_time: {{ .Values.global.dbClient.redis.connMaxIdleTime | quote }}
-        conn_max_lifetime: {{ .Values.global.dbClient.redis.connMaxLifetime | quote }}
 
-    {{- if .Values.processor.config.dispatchMode }}
-    dispatch_mode: {{ .Values.processor.config.dispatchMode | quote }}
+    {{- if .Values.processor.config.progressUpdateInterval }}
+    progress_update_interval: {{ .Values.processor.config.progressUpdateInterval | quote }}
     {{- end }}
+
+    dispatch_mode: {{ $dispatchMode | quote }}
     {{- if .Values.processor.config.asyncDispatch }}
     async_dispatch:
+      transport: {{ default "redis-sortedset" .Values.processor.config.asyncDispatch.transport | quote }}
       result_poll_timeout: {{ .Values.processor.config.asyncDispatch.resultPollTimeout | quote }}
+      poll_interval: {{ default "1s" .Values.processor.config.asyncDispatch.pollInterval | quote }}
+      max_connections: {{ .Values.processor.config.asyncDispatch.maxConnections }}
       {{- if .Values.processor.config.asyncDispatch.models }}
       models:
         {{- range $model, $cfg := .Values.processor.config.asyncDispatch.models }}
@@ -64,6 +75,11 @@ data:
         {{- end }}
       {{- end }}
     {{- end }}
+
+    resumable:
+      lease_duration: {{ .Values.processor.config.resumable.leaseDuration | quote }}
+      finalize_concurrency: {{ .Values.processor.config.resumable.finalizeConcurrency }}
+      finalize_timeout: {{ .Values.processor.config.resumable.finalizeTimeout | quote }}
 
     {{- with .Values.processor.config.globalInferenceGateway }}
     global_inference_gateway:
@@ -133,7 +149,6 @@ data:
     route_key_method: {{ .Values.processor.config.routeKeyMethod | quote }}
     {{- end }}
     default_output_expiration_seconds: {{ .Values.processor.config.defaultOutputExpirationSeconds }}
-    progress_ttl_seconds: {{ .Values.processor.config.progressTTLSeconds }}
 
     file_client:
       type: {{ .Values.global.fileClient.type | quote }}
@@ -169,6 +184,5 @@ data:
 
     enable_pprof: {{ .Values.processor.config.enablePprof }}
     otel:
-      redis_tracing: {{ .Values.global.otel.redisTracing }}
       postgresql_tracing: {{ .Values.global.otel.postgresqlTracing }}
 {{- end }}
