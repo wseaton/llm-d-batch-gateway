@@ -45,11 +45,6 @@ type mockS3Client struct {
 	headErr error
 	delErr  error
 	listErr error
-	// lastPutBodySeekable records whether the last PutObject body
-	// implemented io.ReadSeeker — the SDK's S3 payload-hash middleware
-	// reads and rewinds the body, so a streaming body breaks plain-HTTP
-	// S3-compatible endpoints.
-	lastPutBodySeekable bool
 }
 
 type mockObject struct {
@@ -104,6 +99,11 @@ func (m *mockUploader) Upload(ctx context.Context, params *s3.PutObjectInput, _ 
 		if r.err != nil {
 			return nil, r.err
 		}
+		if params.IfNoneMatch != nil && *params.IfNoneMatch == "*" {
+			if _, exists := m.s3Client.objects[*params.Key]; exists {
+				return nil, &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "object already exists"}
+			}
+		}
 		m.s3Client.objects[*params.Key] = mockObject{
 			data:        r.data,
 			lastModTime: time.Now(),
@@ -128,7 +128,6 @@ func (m *mockS3Client) GetObject(_ context.Context, params *s3.GetObjectInput, _
 }
 
 func (m *mockS3Client) PutObject(_ context.Context, params *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
-	_, m.lastPutBodySeekable = params.Body.(io.ReadSeeker)
 	if params.IfNoneMatch != nil && *params.IfNoneMatch == "*" {
 		if _, exists := m.objects[*params.Key]; exists {
 			return nil, &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "object already exists"}
@@ -773,7 +772,7 @@ func TestOpenStream(t *testing.T) {
 
 		// Both writers pass the open-time existence check — the takeover
 		// shape: a stale owner that opened its stream before the current
-		// owner published. Each streams into its own staging object.
+		// owner published.
 		winner, err := client.OpenStream(ctx, "out.jsonl", testFolderName)
 		if err != nil {
 			t.Fatalf("open winner: %v", err)
@@ -805,35 +804,8 @@ func TestOpenStream(t *testing.T) {
 			t.Errorf("published content = %q, want the winner's %q", obj.data, "winner")
 		}
 
-		// Both staging objects were cleaned up: only the publication
-		// remains.
 		if len(mock.objects) != 1 {
 			t.Errorf("expected only the destination object, got %d objects: %v", len(mock.objects), mock.objects)
-		}
-	})
-
-	t.Run("commit publishes a seekable body", func(t *testing.T) {
-		// Regression guard for the SeaweedFS e2e failure: the SDK's S3
-		// payload-hash middleware reads the PUT body to compute
-		// x-amz-content-sha256 and rewinds it. A streaming (non-seekable)
-		// body makes every publish fail against plain-HTTP S3-compatible
-		// endpoints, parking batches in finalizing forever.
-		ctx := context.Background()
-		mock := newMockS3Client()
-		client := newTestClient(mock)
-
-		w, err := client.OpenStream(ctx, "out.jsonl", testFolderName)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
-		if _, err := w.Write([]byte("line1\n")); err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		if _, err := w.Commit(ctx); err != nil {
-			t.Fatalf("commit: %v", err)
-		}
-		if !mock.lastPutBodySeekable {
-			t.Fatal("publish PUT body was not seekable: the SDK must be able to hash and rewind it")
 		}
 	})
 
