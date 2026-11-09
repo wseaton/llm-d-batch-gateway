@@ -3,9 +3,11 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
 
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	httpclient "github.com/llm-d/llm-d-batch-gateway/pkg/clients/http"
@@ -291,46 +293,92 @@ func TestToFloat64(t *testing.T) {
 }
 
 func TestRecordTokenUsage(t *testing.T) {
-	logger := logr.Discard()
-
-	t.Run("usage present with both fields", func(t *testing.T) {
-		body := map[string]any{
-			"choices": []any{},
-			"usage": map[string]any{
-				"prompt_tokens":     float64(42),
-				"completion_tokens": float64(128),
+	tests := []struct {
+		name           string
+		body           map[string]any
+		wantRecorded   bool
+		wantPrompt     float64
+		wantGeneration float64
+	}{
+		{
+			name: "chat completions usage",
+			body: map[string]any{
+				"choices": []any{},
+				"usage":   map[string]any{"prompt_tokens": float64(42), "completion_tokens": float64(128)},
 			},
-		}
-		recordTokenUsage(body, "token-pipe-both", logger)
-	})
-
-	t.Run("usage missing", func(t *testing.T) {
-		body := map[string]any{"choices": []any{}}
-		recordTokenUsage(body, "token-pipe-missing", logger)
-	})
-
-	t.Run("usage present but no numeric fields", func(t *testing.T) {
-		body := map[string]any{
-			"usage": map[string]any{
-				"prompt_tokens": "not-a-number",
+			wantRecorded: true, wantPrompt: 42, wantGeneration: 128,
+		},
+		{
+			name: "responses usage",
+			body: map[string]any{
+				"output": []any{},
+				"usage":  map[string]any{"input_tokens": float64(11), "output_tokens": float64(58), "total_tokens": float64(69)},
 			},
-		}
-		recordTokenUsage(body, "token-pipe-non-numeric", logger)
-	})
-
-	t.Run("nil body", func(t *testing.T) {
-		recordTokenUsage(nil, "token-pipe-nil", logger)
-	})
-
-	t.Run("negative token values skipped", func(t *testing.T) {
-		body := map[string]any{
-			"usage": map[string]any{
-				"prompt_tokens":     float64(-10),
-				"completion_tokens": float64(50),
+			wantRecorded: true, wantPrompt: 11, wantGeneration: 58,
+		},
+		{
+			name: "prompt-only usage",
+			body: map[string]any{
+				"usage": map[string]any{"prompt_tokens": float64(7), "total_tokens": float64(7)},
 			},
+			wantRecorded: true, wantPrompt: 7,
+		},
+		{
+			name: "chat completions names win over responses names",
+			body: map[string]any{
+				"usage": map[string]any{"prompt_tokens": float64(3), "completion_tokens": float64(4), "input_tokens": float64(100), "output_tokens": float64(200)},
+			},
+			wantRecorded: true, wantPrompt: 3, wantGeneration: 4,
+		},
+		{name: "usage missing", body: map[string]any{"choices": []any{}}},
+		{name: "usage present but no numeric fields", body: map[string]any{"usage": map[string]any{"prompt_tokens": "not-a-number"}}},
+		{name: "nil body"},
+		{
+			name: "negative token values skipped",
+			body: map[string]any{"usage": map[string]any{"prompt_tokens": float64(-10), "completion_tokens": float64(50)}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model := "token-usage-" + strings.ReplaceAll(tt.name, " ", "-")
+			recordTokenUsage(tt.body, model, logr.Discard())
+
+			prompt, promptOK := tokenCounter(t, "batch_request_prompt_tokens_total", model)
+			generation, generationOK := tokenCounter(t, "batch_request_generation_tokens_total", model)
+			if !tt.wantRecorded {
+				if promptOK || generationOK {
+					t.Fatalf("recorded prompt=%v generation=%v, want nothing", prompt, generation)
+				}
+				return
+			}
+			if prompt != tt.wantPrompt || generation != tt.wantGeneration {
+				t.Fatalf("recorded prompt=%v generation=%v, want %v and %v", prompt, generation, tt.wantPrompt, tt.wantGeneration)
+			}
+		})
+	}
+}
+
+// tokenCounter reads a token counter for one model from the default Prometheus
+// registry, reporting false when the model has no sample.
+func tokenCounter(t *testing.T, name, model string) (float64, bool) {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
 		}
-		recordTokenUsage(body, "token-pipe-negative", logger)
-	})
+		for _, m := range family.GetMetric() {
+			for _, label := range m.GetLabel() {
+				if label.GetName() == "model" && label.GetValue() == model {
+					return m.GetCounter().GetValue(), true
+				}
+			}
+		}
+	}
+	return 0, false
 }
 
 var _ inference.InferenceClient = (*mockInferenceClientForDirectTest)(nil)

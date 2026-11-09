@@ -175,6 +175,10 @@ func recordTokenUsage(body map[string]any, model string, logger logr.Logger) {
 	prompt, pOK := toFloat64(usage["prompt_tokens"])
 	completion, cOK := toFloat64(usage["completion_tokens"])
 	if !pOK && !cOK {
+		prompt, pOK = toFloat64(usage["input_tokens"])
+		completion, cOK = toFloat64(usage["output_tokens"])
+	}
+	if !pOK && !cOK {
 		return
 	}
 	if prompt < 0 || completion < 0 {
