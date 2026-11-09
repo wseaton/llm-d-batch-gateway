@@ -85,6 +85,18 @@ type DBClient[T any, Q any] interface {
 	DBDelete(ctx context.Context, IDs []string) (deletedIDs []string, err error)
 }
 
+// BatchProgressDBClient is a BatchDBClient that additionally supports
+// in-flight progress updates.
+type BatchProgressDBClient interface {
+	BatchDBClient
+
+	// DBUpdateProgress writes JSON-encoded request counts to the item's status
+	// column, fenced by the item's current epoch. A write carrying a stale epoch
+	// (e.g. from a fenced-out processor incarnation) matches no rows and returns
+	// ErrConflict, so the caller knows it is no longer the owner and can abort.
+	DBUpdateProgress(ctx context.Context, id string, epoch int64, countsJSON []byte) error
+}
+
 // Tags are key-value pairs for filtering items.
 type Tags map[string]string
 
@@ -109,8 +121,15 @@ type BatchJobPriority struct {
 	Data  []byte    `json:"data,omitempty"`  // [optional] User defined data.
 	TTL   int       `json:"ttl,omitempty"`   // [optional] TTL in seconds applied on the entire queue. If used, this should be set to a sufficiently large value to prevent premature removal of items.
 	Epoch int64     `json:"epoch,omitempty"` // Fencing token incremented on every ownership change.
+	// ProcessorID and ExpectedStatus fence Postgres re-enqueue against the
+	// ownership and lifecycle state observed by the caller.
+	ProcessorID    string `json:"processor_id,omitempty"`
+	ExpectedStatus string `json:"expected_status,omitempty"`
 	// RecoveryAttempts counts startup recoveries of the current ownership.
 	RecoveryAttempts int64 `json:"recovery_attempts,omitempty"`
+	// Resumable is the durable marker observed by PQClaimOwned. Recovery uses
+	// this claimed-row value when a follow-up database read is unavailable.
+	Resumable bool `json:"resumable,omitempty"`
 }
 
 func (bj *BatchJobPriority) IsValid() error {
@@ -207,19 +226,8 @@ type BatchEventChannelClient interface {
 	ECProducerSendEvents(ctx context.Context, events []BatchEvent) (sentIDs []string, err error)
 }
 
-// -- Batch jobs temporary status store --
-
-// BatchStatusClient enables to manage temporary job status.
-type BatchStatusClient interface {
-	store.BatchClientAdmin
-
-	// StatusSet stores or updates status data for a job.
-	StatusSet(ctx context.Context, ID string, TTL int, data []byte) (err error)
-
-	// StatusGet retrieves the status data of a job.
-	// If no data exists (nil, nil) is returned.
-	StatusGet(ctx context.Context, ID string) (data []byte, err error)
-
-	// StatusDelete deletes the status data for a job.
-	StatusDelete(ctx context.Context, ID string) (nDeleted int, err error)
+// BatchEventGC removes expired events. The GC process runs the backend's
+// implementation until the context is cancelled.
+type BatchEventGC interface {
+	Run(ctx context.Context) error
 }

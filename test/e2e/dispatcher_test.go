@@ -32,6 +32,7 @@ import (
 	"github.com/llm-d/llm-d-async/producer"
 	"github.com/openai/openai-go/v3"
 	"github.com/redis/go-redis/v9"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -92,21 +93,60 @@ func newDispatcherProducer(t *testing.T, rdb *redis.Client, poolName string) *pr
 	return p
 }
 
-// detectDispatcherDeployed checks whether at least one llm-d Async deployment
-// exists in the test namespace.
+// detectDispatcherDeployed checks the processor's active dispatch mode. This
+// avoids treating stale llm-d-async deployments as evidence that the processor
+// is still configured for async dispatch.
 func detectDispatcherDeployed(t *testing.T) bool {
 	t.Helper()
 
-	out, err := exec.Command("kubectl", "get", "deployments",
+	configMap := fmt.Sprintf("%s-processor-config", testHelmRelease)
+	out, err := exec.Command("kubectl", "get", "configmap", configMap,
 		"-n", testNamespace,
-		"-l", "app.kubernetes.io/name in (async-processor,llm-d-async)",
-		"-o", "name",
+		"-o", "jsonpath={.data.config\\.yaml}",
 	).CombinedOutput()
 	if err != nil {
-		t.Logf("kubectl get deployments failed: %v", err)
+		t.Logf("kubectl get processor config failed: %v\n%s", err, out)
 		return false
 	}
-	return strings.TrimSpace(string(out)) != ""
+	dispatchMode, err := processorDispatchMode(out)
+	if err != nil {
+		t.Logf("parse processor config failed: %v", err)
+		return false
+	}
+	return dispatchMode == "async"
+}
+
+func processorDispatchMode(data []byte) (string, error) {
+	var cfg struct {
+		DispatchMode string `yaml:"dispatch_mode"`
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return "", err
+	}
+	return cfg.DispatchMode, nil
+}
+
+func TestProcessorDispatchMode(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{name: "async", data: `dispatch_mode: "async"`, want: "async"},
+		{name: "sync", data: `dispatch_mode: "sync"`, want: "sync"},
+		{name: "omitted", data: `poll_interval: "5s"`, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := processorDispatchMode([]byte(tt.data))
+			if err != nil {
+				t.Fatalf("processorDispatchMode() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("processorDispatchMode() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
 
 func TestDispatcher(t *testing.T) {
@@ -154,6 +194,9 @@ func TestDispatcher(t *testing.T) {
 	t.Run("BatchAPIDispatchGate", func(t *testing.T) {
 		testBatchAPIDispatchGate(t, rdb)
 	})
+	t.Run("BatchAPIHardKillRecovery", func(t *testing.T) {
+		testBatchAPIHardKillRecovery(t, rdb)
+	})
 	t.Run("EndpointScrapeGate", func(t *testing.T) {
 		testDispatcherEndpointScrapeGate(t, rdb)
 	})
@@ -166,7 +209,7 @@ func TestDispatcher(t *testing.T) {
 // from the async ResultMessage (e.g. 403 with an empty body) is preserved in
 // the batch output file instead of being collapsed into parse_error.
 //
-// Uses the consumer-less "sim-pool-inject" pool: no async-processor subscribes
+// Uses the consumer-less "sim-pool-inject" pool: no llm-d-async subscribes
 // to it, so the request stays in the queue deterministically until the test
 // removes it and injects a synthetic ResultMessage.
 func testDispatcherHTTPErrorStatusPreserved(t *testing.T, rdb *redis.Client) {
@@ -198,7 +241,7 @@ func testDispatcherHTTPErrorStatusPreserved(t *testing.T, rdb *redis.Client) {
 		t.Fatalf("LPUSH result: %v", err)
 	}
 
-	finalBatch := waitForRetryExhaustion(t, batchID, 2*time.Minute)
+	finalBatch := waitForTerminalBatch(t, batchID, 2*time.Minute)
 
 	if finalBatch.Status != openai.BatchStatusCompleted {
 		t.Errorf("expected batch status %q, got %q", openai.BatchStatusCompleted, finalBatch.Status)
@@ -353,58 +396,16 @@ func testDispatcherMultiRequestBatch(t *testing.T, rdb *redis.Client) {
 // testDispatcherMultiReplicaBatch verifies that two healthy Batch Processor
 // replicas do not consume and discard one another's async results.
 func testDispatcherMultiReplicaBatch(t *testing.T) {
-	selector := fmt.Sprintf("app.kubernetes.io/instance=%s,app.kubernetes.io/component=processor", testHelmRelease)
-	var workloads []string
-	var discoveryErrors []string
-	for _, kind := range []string{"deployment", "statefulset"} {
-		out, err := exec.Command("kubectl", "get", kind,
-			"-n", testNamespace,
-			"-l", selector,
-			"-o", `jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}`,
-		).CombinedOutput()
-		if err != nil {
-			discoveryErrors = append(discoveryErrors, fmt.Sprintf("%s: %v: %s", kind, err, strings.TrimSpace(string(out))))
-			continue
-		}
-		for _, name := range strings.Fields(string(out)) {
-			workloads = append(workloads, kind+"/"+name)
-		}
-	}
-	if len(workloads) != 1 {
-		t.Fatalf("find one Processor workload with selector %q: found %v; discovery errors: %v", selector, workloads, discoveryErrors)
-	}
-	workload := workloads[0]
-	replicasOut, err := exec.Command("kubectl", "get", workload,
-		"-n", testNamespace, "-o", "jsonpath={.spec.replicas}").CombinedOutput()
-	if err != nil {
-		t.Fatalf("get Processor replica count for %s: %v\n%s", workload, err, replicasOut)
-	}
-	originalReplicas, err := strconv.Atoi(strings.TrimSpace(string(replicasOut)))
-	if err != nil {
-		t.Fatalf("parse Processor replica count %q: %v", replicasOut, err)
-	}
-
-	scaleProcessor := func(replicas int) error {
-		out, scaleErr := exec.Command("kubectl", "scale", workload,
-			"-n", testNamespace, fmt.Sprintf("--replicas=%d", replicas)).CombinedOutput()
-		if scaleErr != nil {
-			return fmt.Errorf("scale Processor to %d replicas: %w\n%s", replicas, scaleErr, out)
-		}
-		out, scaleErr = exec.Command("kubectl", "rollout", "status", workload,
-			"-n", testNamespace, "--timeout=180s").CombinedOutput()
-		if scaleErr != nil {
-			return fmt.Errorf("wait for %d Processor replicas: %w\n%s", replicas, scaleErr, out)
-		}
-		return nil
-	}
+	workload := processorWorkload(t)
+	originalReplicas := processorReplicaCount(t, workload)
 
 	if originalReplicas != 2 {
 		t.Cleanup(func() {
-			if err := scaleProcessor(originalReplicas); err != nil {
+			if err := scaleProcessorWorkload(workload, originalReplicas); err != nil {
 				t.Errorf("cleanup: %v", err)
 			}
 		})
-		if err := scaleProcessor(2); err != nil {
+		if err := scaleProcessorWorkload(workload, 2); err != nil {
 			t.Fatal(err)
 		}
 	}

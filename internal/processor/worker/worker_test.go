@@ -2,9 +2,13 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
+	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
+	mockdb "github.com/llm-d/llm-d-batch-gateway/internal/database/mock"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/config"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/clientset"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/semaphore"
@@ -13,8 +17,20 @@ import (
 
 func TestClientsetFields_Assigned(t *testing.T) {
 	cs := validProcessorClients(t)
-	if cs.BatchDB == nil || cs.FileDB == nil || cs.File == nil || cs.Queue == nil || cs.Status == nil || cs.Event == nil || cs.Inference == nil {
+	if cs.BatchDB == nil || cs.BatchProgressDB == nil || cs.FileDB == nil || cs.File == nil || cs.Queue == nil || cs.Event == nil || cs.Inference == nil {
 		t.Fatalf("expected all clients to be assigned")
+	}
+}
+
+func TestNewProcessor_RequiresProgressClient(t *testing.T) {
+	clients := validProcessorClients(t)
+	clients.BatchProgressDB = nil
+	p, err := NewProcessor(config.NewConfig(), clients, "test-pod", testLogger(t))
+	if err != nil {
+		t.Fatalf("NewProcessor: %v", err)
+	}
+	if err := p.validate(); err == nil {
+		t.Fatal("expected validation error when progress DB client is missing")
 	}
 }
 
@@ -44,10 +60,19 @@ func TestValidate_InferenceClientRequired(t *testing.T) {
 		cs := validProcessorClients(t)
 		cs.Inference = nil
 		cs.AsyncInference = &inference.AsyncGatewayResolver{}
+		cs.Resumable = mockdb.NewMockResumableStore()
 		p := mustNewProcessor(t, config.NewConfig(), cs)
 
 		if err := p.validate(); err != nil {
 			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("rejects inference without resumable store", func(t *testing.T) {
+		cs := validProcessorClients(t)
+		cs.Resumable = nil
+		if _, err := NewProcessor(config.NewConfig(), cs, "test-pod", testLogger(t)); err == nil {
+			t.Fatal("expected constructor error without a resumable store")
 		}
 	})
 }
@@ -70,9 +95,32 @@ func TestNewProcessor_InvalidGlobalConcurrency(t *testing.T) {
 	}
 }
 
+func TestInitConcurrencyControls_CapsWorkersByInputDiskBudget(t *testing.T) {
+	cfg := config.NewConfig()
+	cfg.NumWorkers = 20
+	cfg.WorkDirSizeLimit = "10Gi"
+	cfg.InputFileDiskBudgetPercent = 10
+
+	p := mustNewProcessor(t, cfg, validProcessorClients(t))
+	if err := p.initConcurrencyControls(logr.Discard(), func() {}); err != nil {
+		t.Fatalf("initConcurrencyControls() error = %v", err)
+	}
+
+	for range 5 {
+		if !p.tokens.TryAcquire() {
+			t.Fatal("worker token unavailable before the input-disk cap")
+		}
+	}
+	if p.tokens.TryAcquire() {
+		t.Fatal("worker token available beyond the input-disk cap")
+	}
+}
+
 func TestProcessorPrepare_ReturnsValidationError(t *testing.T) {
 	cfg := config.NewConfig()
-	p := mustNewProcessor(t, cfg, &clientset.Clientset{})
+	clients := validProcessorClients(t)
+	clients.Event = nil
+	p := mustNewProcessor(t, cfg, clients)
 
 	if err := p.prepare(context.Background()); err == nil {
 		t.Fatalf("expected validation error")
@@ -89,6 +137,25 @@ func TestProcessorRun_ContextCanceled_ReturnsNil(t *testing.T) {
 	cancel()
 	if err := p.Run(ctx, nil); err != nil {
 		t.Fatalf("expected nil on canceled context run, got %v", err)
+	}
+}
+
+func TestProcessorRun_RecoveryFailureReturnsBeforeReady(t *testing.T) {
+	clients := validProcessorClients(t)
+	claimErr := errors.New("claim failed")
+	queue := clients.Queue.(*mockdb.MockBatchPriorityQueueClient)
+	queue.OnClaimOwned = func(context.Context) ([]*db.BatchJobPriority, error) {
+		return nil, claimErr
+	}
+	p := mustNewProcessor(t, config.NewConfig(), clients)
+	ready := false
+
+	err := p.Run(context.Background(), func() { ready = true })
+	if !errors.Is(err, claimErr) {
+		t.Fatalf("expected recovery error, got %v", err)
+	}
+	if ready {
+		t.Fatal("processor became ready after startup recovery failed")
 	}
 }
 

@@ -92,6 +92,10 @@ func (d *dbGetErrWrapper) DBDelete(ctx context.Context, IDs []string) ([]string,
 	return d.inner.DBDelete(ctx, IDs)
 }
 
+func (d *dbGetErrWrapper) DBUpdateProgress(ctx context.Context, id string, epoch int64, countsJSON []byte) error {
+	return d.inner.DBUpdateProgress(ctx, id, epoch, countsJSON)
+}
+
 func (d *dbGetErrWrapper) GetContext(parentCtx context.Context, timeLimit time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parentCtx, timeLimit)
 }
@@ -112,7 +116,7 @@ func TestPoller_DequeueOne_EmptyQueue_ReturnsNil(t *testing.T) {
 
 	p := NewPoller(pq, dbClient)
 
-	task, err := p.dequeueOne(ctx)
+	task, err := p.dequeueOne(ctx, 0)
 	if err != nil {
 		t.Fatalf("DequeueOne() err=%v, want nil", err)
 	}
@@ -135,7 +139,7 @@ func TestPoller_DequeueOne_PQError_ReturnsError(t *testing.T) {
 
 	p := NewPoller(pq, dbClient)
 
-	task, err := p.dequeueOne(ctx)
+	task, err := p.dequeueOne(ctx, 0)
 	if err == nil {
 		t.Fatalf("DequeueOne() err=nil, want error")
 	}
@@ -164,7 +168,7 @@ func TestPoller_DequeueOne_ReturnsFirstTask(t *testing.T) {
 
 	p := NewPoller(pq, dbClient)
 
-	task, err := p.dequeueOne(ctx)
+	task, err := p.dequeueOne(ctx, 0)
 	if err != nil {
 		t.Fatalf("DequeueOne() err=%v, want nil", err)
 	}

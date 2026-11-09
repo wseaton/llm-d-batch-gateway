@@ -95,6 +95,7 @@ func TestPreProcess_BuildsPlansAndModelMap_OffsetsCorrect(t *testing.T) {
 			ID: jobID,
 			BatchSpec: openai.BatchSpec{
 				InputFileID: inputFileID,
+				Endpoint:    openai.EndpointChatCompletions,
 			},
 			BatchStatusInfo: openai.BatchStatusInfo{
 				Status: openai.BatchStatusInProgress,
@@ -103,7 +104,7 @@ func TestPreProcess_BuildsPlansAndModelMap_OffsetsCorrect(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	if err := p.preProcessJob(ctx, jobInfo); err != nil {
+	if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
 		t.Fatalf("preProcessJob: %v", err)
 	}
 
@@ -244,6 +245,7 @@ func TestPreProcess_SystemPrompts_PrefixHashAndSortOrder(t *testing.T) {
 			ID: jobID,
 			BatchSpec: openai.BatchSpec{
 				InputFileID: inputFileID,
+				Endpoint:    openai.EndpointChatCompletions,
 			},
 			BatchStatusInfo: openai.BatchStatusInfo{
 				Status: openai.BatchStatusInProgress,
@@ -252,7 +254,7 @@ func TestPreProcess_SystemPrompts_PrefixHashAndSortOrder(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	if err := p.preProcessJob(ctx, jobInfo); err != nil {
+	if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
 		t.Fatalf("preProcessJob: %v", err)
 	}
 
@@ -343,7 +345,6 @@ func TestWatchCancel_SetsFlag_CancelsInferContext(t *testing.T) {
 	ctx := testLoggerCtx(t)
 
 	dbClient := newSpyBatchDB(newMockBatchDBClient())
-	statusClient := mockdb.NewMockBatchStatusClient()
 	eventClient := mockdb.NewMockBatchEventChannelClient()
 
 	jobID := "job-cancel-1"
@@ -365,7 +366,7 @@ func TestWatchCancel_SetsFlag_CancelsInferContext(t *testing.T) {
 	}
 
 	p := mustNewProcessor(t, config.NewConfig(), &clientset.Clientset{})
-	updater := NewStatusUpdater(dbClient, statusClient, 86400)
+	updater := NewStatusUpdater(dbClient)
 
 	evCh, err := eventClient.ECConsumerGetChannel(ctx, jobID)
 	if err != nil {
@@ -466,6 +467,7 @@ func TestPreProcess_CancelFlag_ReturnsErrCancelled(t *testing.T) {
 			ID: jobID,
 			BatchSpec: openai.BatchSpec{
 				InputFileID: inputFileID,
+				Endpoint:    openai.EndpointChatCompletions,
 			},
 			BatchStatusInfo: openai.BatchStatusInfo{
 				Status: openai.BatchStatusInProgress,
@@ -476,7 +478,7 @@ func TestPreProcess_CancelFlag_ReturnsErrCancelled(t *testing.T) {
 
 	cancelCtx, cancel := context.WithCancelCause(ctx)
 	cancel(batchctx.ErrCancelled)
-	err = p.preProcessJob(cancelCtx, jobInfo)
+	_, err = p.preProcessJob(cancelCtx, jobInfo)
 	if !errors.Is(err, batchctx.ErrCancelled) {
 		t.Fatalf("expected batchctx.ErrCancelled, got: %v", err)
 	}
@@ -500,7 +502,7 @@ func TestPreProcess_GenuineErrorNotMaskedByCancel(t *testing.T) {
 		BatchJob: &openai.Batch{BatchSpec: openai.BatchSpec{InputFileID: ""}},
 	}
 
-	err := p.preProcessJob(ctx, jobInfo)
+	_, err := p.preProcessJob(ctx, jobInfo)
 	if err == nil {
 		t.Fatal("expected an error for empty input file ID")
 	}
@@ -567,6 +569,7 @@ func TestPreProcess_CancelBeforeSIGTERM_ReturnsErrCancelled(t *testing.T) {
 			ID: jobID,
 			BatchSpec: openai.BatchSpec{
 				InputFileID: inputFileID,
+				Endpoint:    openai.EndpointChatCompletions,
 			},
 			BatchStatusInfo: openai.BatchStatusInfo{
 				Status: openai.BatchStatusInProgress,
@@ -583,7 +586,7 @@ func TestPreProcess_CancelBeforeSIGTERM_ReturnsErrCancelled(t *testing.T) {
 	cancelUser(batchctx.ErrCancelled)  // user cancel first
 	tripShutdown(batchctx.ErrShutdown) // SIGTERM second — no-op on the already-cancelled inner layer
 
-	err = p.preProcessJob(cancelCtx, jobInfo)
+	_, err = p.preProcessJob(cancelCtx, jobInfo)
 	if !errors.Is(err, batchctx.ErrCancelled) {
 		t.Fatalf("expected batchctx.ErrCancelled when user cancel is recorded before SIGTERM, got: %v", err)
 	}
@@ -641,6 +644,7 @@ func TestPreProcess_SLOExpiredDuringIngestion_ReturnsErrExpired(t *testing.T) {
 			ID: jobID,
 			BatchSpec: openai.BatchSpec{
 				InputFileID: inputFileID,
+				Endpoint:    openai.EndpointChatCompletions,
 			},
 			BatchStatusInfo: openai.BatchStatusInfo{
 				Status: openai.BatchStatusInProgress,
@@ -653,7 +657,7 @@ func TestPreProcess_SLOExpiredDuringIngestion_ReturnsErrExpired(t *testing.T) {
 	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(-1*time.Second))
 	defer sloCancel()
 
-	err = p.preProcessJob(sloCtx, jobInfo)
+	_, err = p.preProcessJob(sloCtx, jobInfo)
 	if !errors.Is(err, batchctx.ErrExpired) {
 		t.Fatalf("expected batchctx.ErrExpired, got: %v", err)
 	}
@@ -667,10 +671,8 @@ func TestHandleCancelled_CleansDir_UpdatesCancelled(t *testing.T) {
 	cfg.WorkDir = workDir
 
 	dbClient := newMockBatchDBClient()
-	statusClient := mockdb.NewMockBatchStatusClient()
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -704,7 +706,7 @@ func TestHandleCancelled_CleansDir_UpdatesCancelled(t *testing.T) {
 		t.Fatalf("WriteFile dummy: %v", err)
 	}
 
-	updater := NewStatusUpdater(dbClient, statusClient, 86400)
+	updater := NewStatusUpdater(dbClient)
 
 	if err := p.handleCancelled(ctx, &jobExecutionParams{
 		updater: updater,
@@ -744,7 +746,6 @@ func TestRunPollingLoop_ExpiredJob_UpdatesExpiredStatus(t *testing.T) {
 
 	pq := &spyPQ{inner: mockdb.NewMockBatchPriorityQueueClient()}
 	dbClient := newSpyBatchDB(newMockBatchDBClient())
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-expired-1"
 
 	jobItem := &db.BatchItem{
@@ -777,7 +778,6 @@ func TestRunPollingLoop_ExpiredJob_UpdatesExpiredStatus(t *testing.T) {
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -808,7 +808,6 @@ func TestRunPollingLoop_DBTransient_ReEnqueuesTask(t *testing.T) {
 		inner: innerDB,
 		err:   errors.New("db transient"),
 	}
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-db-transient-1"
 
 	if err := pq.PQEnqueue(ctx, &db.BatchJobPriority{
@@ -822,7 +821,6 @@ func TestRunPollingLoop_DBTransient_ReEnqueuesTask(t *testing.T) {
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -846,7 +844,6 @@ func TestRunPollingLoop_MalformedJobItem_MarksFailed(t *testing.T) {
 
 	pq := &spyPQ{inner: mockdb.NewMockBatchPriorityQueueClient()}
 	dbClient := newSpyBatchDB(newMockBatchDBClient())
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-malformed-1"
 
 	jobItem := &db.BatchItem{
@@ -880,7 +877,6 @@ func TestRunPollingLoop_MalformedJobItem_MarksFailed(t *testing.T) {
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -907,7 +903,6 @@ func TestRunPollingLoop_NotRunnableJob_SkipsWithoutStatusUpdate(t *testing.T) {
 
 	pq := &spyPQ{inner: mockdb.NewMockBatchPriorityQueueClient()}
 	dbClient := newSpyBatchDB(newMockBatchDBClient())
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-not-runnable-1"
 
 	jobItem := &db.BatchItem{
@@ -941,7 +936,6 @@ func TestRunPollingLoop_NotRunnableJob_SkipsWithoutStatusUpdate(t *testing.T) {
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -974,7 +968,6 @@ func TestRunPollingLoop_GuardCancelAfterDequeue_ReEnqueuesBeforeLaunch(t *testin
 		},
 	}
 	dbClient := newSpyBatchDB(newMockBatchDBClient())
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-guard-requeue-1"
 
 	jobItem := &db.BatchItem{
@@ -1006,7 +999,6 @@ func TestRunPollingLoop_GuardCancelAfterDequeue_ReEnqueuesBeforeLaunch(t *testin
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -1037,7 +1029,6 @@ func TestRunPollingLoop_SIGTERMAfterDequeue_ReEnqueuesViaDetachedCtx(t *testing.
 		},
 	}
 	dbClient := newSpyBatchDB(newMockBatchDBClient())
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-sigterm-requeue-1"
 
 	jobItem := &db.BatchItem{
@@ -1069,7 +1060,6 @@ func TestRunPollingLoop_SIGTERMAfterDequeue_ReEnqueuesViaDetachedCtx(t *testing.
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -1107,7 +1097,6 @@ func TestRunPollingLoop_FetchFailsWithCancelledCtx_ReEnqueuesViaDetachedCtx(t *t
 		inner: innerDB,
 		err:   context.Canceled,
 	}
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-fetch-cancel-requeue-1"
 
 	if err := pq.PQEnqueue(ctx, &db.BatchJobPriority{
@@ -1120,7 +1109,6 @@ func TestRunPollingLoop_FetchFailsWithCancelledCtx_ReEnqueuesViaDetachedCtx(t *t
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -1152,10 +1140,9 @@ func TestRunPollingLoop_GuardReEnqueueFails_FallsBackToHandleFailed(t *testing.T
 		afterDequeueFn: func() {
 			pollingCancel()
 		},
-		enqueueErr: fmt.Errorf("redis unavailable"),
+		enqueueErr: fmt.Errorf("queue unavailable"),
 	}
 	dbClient := newSpyBatchDB(newMockBatchDBClient())
-	statusClient := mockdb.NewMockBatchStatusClient()
 	jobID := "job-guard-fail-fallback-1"
 
 	jobItem := &db.BatchItem{
@@ -1187,7 +1174,6 @@ func TestRunPollingLoop_GuardReEnqueueFails_FallsBackToHandleFailed(t *testing.T
 	clients := &clientset.Clientset{
 		BatchDB: dbClient,
 		Queue:   pq,
-		Status:  statusClient,
 	}
 	p := mustNewProcessor(t, cfg, clients)
 
@@ -1207,7 +1193,7 @@ func TestRunPollingLoop_GuardReEnqueueFails_FallsBackToHandleFailed(t *testing.T
 
 func TestExtractAndValidateLine_StreamTrue_ReturnsError(t *testing.T) {
 	line := []byte(`{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"hi"}]}}` + "\n")
-	_, err := extractAndValidateLine(line)
+	_, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "/v1/chat/completions")
 	if err == nil {
 		t.Fatal("expected error for stream: true, got nil")
 	}
@@ -1218,7 +1204,7 @@ func TestExtractAndValidateLine_StreamTrue_ReturnsError(t *testing.T) {
 
 func TestExtractAndValidateLine_StreamFalse_OK(t *testing.T) {
 	line := []byte(`{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"hi"}]}}` + "\n")
-	meta, err := extractAndValidateLine(line)
+	meta, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "/v1/chat/completions")
 	if err != nil {
 		t.Fatalf("unexpected error for stream: false: %v", err)
 	}
@@ -1232,7 +1218,7 @@ func TestExtractAndValidateLine_StreamFalse_OK(t *testing.T) {
 
 func TestExtractAndValidateLine_StreamOmitted_OK(t *testing.T) {
 	line := []byte(`{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}` + "\n")
-	meta, err := extractAndValidateLine(line)
+	meta, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "/v1/chat/completions")
 	if err != nil {
 		t.Fatalf("unexpected error when stream is omitted: %v", err)
 	}
@@ -1243,7 +1229,7 @@ func TestExtractAndValidateLine_StreamOmitted_OK(t *testing.T) {
 
 func TestExtractAndValidateLine_EmptyCustomID_ReturnsError(t *testing.T) {
 	line := []byte(`{"custom_id":"","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}` + "\n")
-	_, err := extractAndValidateLine(line)
+	_, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "/v1/chat/completions")
 	if err == nil {
 		t.Fatal("expected error for empty custom_id, got nil")
 	}
@@ -1254,7 +1240,7 @@ func TestExtractAndValidateLine_EmptyCustomID_ReturnsError(t *testing.T) {
 
 func TestExtractAndValidateLine_MissingCustomID_ReturnsError(t *testing.T) {
 	line := []byte(`{"method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}` + "\n")
-	_, err := extractAndValidateLine(line)
+	_, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "/v1/chat/completions")
 	if err == nil {
 		t.Fatal("expected error for missing custom_id, got nil")
 	}
@@ -1265,7 +1251,7 @@ func TestExtractAndValidateLine_MissingCustomID_ReturnsError(t *testing.T) {
 
 func TestExtractAndValidateLine_MissingMethod_ReturnsError(t *testing.T) {
 	line := []byte(`{"custom_id":"r1","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}` + "\n")
-	_, err := extractAndValidateLine(line)
+	_, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "/v1/chat/completions")
 	if err == nil {
 		t.Fatal("expected error for missing method, got nil")
 	}
@@ -1276,7 +1262,7 @@ func TestExtractAndValidateLine_MissingMethod_ReturnsError(t *testing.T) {
 
 func TestExtractAndValidateLine_InvalidMethod_ReturnsError(t *testing.T) {
 	line := []byte(`{"custom_id":"r1","method":"DELETE","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}` + "\n")
-	_, err := extractAndValidateLine(line)
+	_, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "/v1/chat/completions")
 	if err == nil {
 		t.Fatal("expected error for invalid method, got nil")
 	}
@@ -1287,7 +1273,7 @@ func TestExtractAndValidateLine_InvalidMethod_ReturnsError(t *testing.T) {
 
 func TestExtractAndValidateLine_MissingURL_ReturnsError(t *testing.T) {
 	line := []byte(`{"custom_id":"r1","method":"POST","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}` + "\n")
-	_, err := extractAndValidateLine(line)
+	_, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "/v1/chat/completions")
 	if err == nil {
 		t.Fatal("expected error for missing url, got nil")
 	}
@@ -1298,7 +1284,7 @@ func TestExtractAndValidateLine_MissingURL_ReturnsError(t *testing.T) {
 
 func TestExtractAndValidateLine_AbsoluteURL_ReturnsError(t *testing.T) {
 	line := []byte(`{"custom_id":"r1","method":"POST","url":"http://evil.com","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}` + "\n")
-	_, err := extractAndValidateLine(line)
+	_, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "/v1/chat/completions")
 	if err == nil {
 		t.Fatal("expected error for absolute url, got nil")
 	}
@@ -1309,7 +1295,7 @@ func TestExtractAndValidateLine_AbsoluteURL_ReturnsError(t *testing.T) {
 
 func TestExtractAndValidateLine_DoubleSlashURL_ReturnsError(t *testing.T) {
 	line := []byte(`{"custom_id":"r1","method":"POST","url":"//evil.com","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}` + "\n")
-	_, err := extractAndValidateLine(line)
+	_, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "/v1/chat/completions")
 	if err == nil {
 		t.Fatal("expected error for protocol-relative url, got nil")
 	}
@@ -1320,7 +1306,7 @@ func TestExtractAndValidateLine_DoubleSlashURL_ReturnsError(t *testing.T) {
 
 func TestExtractAndValidateLine_NotAllowedEndpoint_ReturnsError(t *testing.T) {
 	line := []byte(`{"custom_id":"r1","method":"POST","url":"/not-allowed","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}` + "\n")
-	_, err := extractAndValidateLine(line)
+	_, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "/v1/chat/completions")
 	if err == nil {
 		t.Fatal("expected error for invalid endpoint, got nil")
 	}
@@ -1329,9 +1315,53 @@ func TestExtractAndValidateLine_NotAllowedEndpoint_ReturnsError(t *testing.T) {
 	}
 }
 
+func TestExtractAndValidateLine_BatchEndpointMismatch(t *testing.T) {
+	line := []byte(`{"custom_id":"r1","method":"POST","url":"/v1/embeddings","body":{"model":"embedding-model"}}` + "\n")
+	_, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "/v1/chat/completions")
+	if err == nil {
+		t.Fatal("expected error when request endpoint differs from batch endpoint")
+	}
+	if !strings.Contains(err.Error(), "does not match batch endpoint") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestExtractAndValidateLine_EmptyBatchEndpoint(t *testing.T) {
+	line := []byte(`{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4"}}` + "\n")
+	_, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "")
+	if err == nil {
+		t.Fatal("expected error when stored batch endpoint is empty")
+	}
+	if !strings.Contains(err.Error(), "does not match batch endpoint") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestExtractAndValidateLine_BatchEndpointMatch(t *testing.T) {
+	line := []byte(`{"custom_id":"r1","method":"POST","url":"/v1/embeddings","body":{"model":"embedding-model"}}` + "\n")
+	if _, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "/v1/embeddings"); err != nil {
+		t.Fatalf("unexpected error when endpoints match: %v", err)
+	}
+}
+
+func TestExtractAndValidateLine_ConfiguredEndpoint_OK(t *testing.T) {
+	line := []byte(`{"custom_id":"r1","method":"POST","url":"/v1/classify","body":{"model":"classifier"}}` + "\n")
+	allowlist, err := openai.NewEndpointAllowlist([]string{"/v1/classify"})
+	if err != nil {
+		t.Fatalf("NewEndpointAllowlist() unexpected error: %v", err)
+	}
+	meta, err := extractAndValidateLine(line, allowlist, "/v1/classify")
+	if err != nil {
+		t.Fatalf("unexpected error for configured endpoint: %v", err)
+	}
+	if meta.ModelID != "classifier" {
+		t.Fatalf("expected model classifier, got %s", meta.ModelID)
+	}
+}
+
 func TestExtractAndValidateLine_AllowedEndpoint_OK(t *testing.T) {
 	line := []byte(`{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}` + "\n")
-	meta, err := extractAndValidateLine(line)
+	meta, err := extractAndValidateLine(line, openai.EndpointAllowlist{}, "/v1/chat/completions")
 	if err != nil {
 		t.Fatalf("unexpected error for allowed endpoint: %v", err)
 	}
@@ -1393,6 +1423,7 @@ func TestPreProcess_StreamTrue_FailsJob(t *testing.T) {
 			ID: jobID,
 			BatchSpec: openai.BatchSpec{
 				InputFileID: inputFileID,
+				Endpoint:    openai.EndpointChatCompletions,
 			},
 			BatchStatusInfo: openai.BatchStatusInfo{
 				Status: openai.BatchStatusInProgress,
@@ -1401,7 +1432,7 @@ func TestPreProcess_StreamTrue_FailsJob(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	err = p.preProcessJob(ctx, jobInfo)
+	_, err = p.preProcessJob(ctx, jobInfo)
 	if err == nil {
 		t.Fatal("expected preProcessJob to fail for input with stream: true")
 	}
@@ -1460,6 +1491,7 @@ func TestPreProcess_DuplicateCustomID_FailsJob(t *testing.T) {
 			ID: jobID,
 			BatchSpec: openai.BatchSpec{
 				InputFileID: inputFileID,
+				Endpoint:    openai.EndpointChatCompletions,
 			},
 			BatchStatusInfo: openai.BatchStatusInfo{
 				Status: openai.BatchStatusInProgress,
@@ -1468,7 +1500,7 @@ func TestPreProcess_DuplicateCustomID_FailsJob(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	err = p.preProcessJob(ctx, jobInfo)
+	_, err = p.preProcessJob(ctx, jobInfo)
 	if err == nil {
 		t.Fatal("expected preProcessJob to fail for duplicate custom_id")
 	}
@@ -1530,6 +1562,7 @@ func TestPreProcess_UniqueCustomIDs_Succeeds(t *testing.T) {
 			ID: jobID,
 			BatchSpec: openai.BatchSpec{
 				InputFileID: inputFileID,
+				Endpoint:    openai.EndpointChatCompletions,
 			},
 			BatchStatusInfo: openai.BatchStatusInfo{
 				Status: openai.BatchStatusInProgress,
@@ -1538,7 +1571,7 @@ func TestPreProcess_UniqueCustomIDs_Succeeds(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	if err := p.preProcessJob(ctx, jobInfo); err != nil {
+	if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
 		t.Fatalf("expected preProcessJob to succeed with unique custom_ids, got: %v", err)
 	}
 }
@@ -1608,6 +1641,7 @@ func TestPreProcess_UnregisteredModel_RejectedToErrorFile(t *testing.T) {
 			ID: jobID,
 			BatchSpec: openai.BatchSpec{
 				InputFileID: inputFileID,
+				Endpoint:    openai.EndpointChatCompletions,
 			},
 			BatchStatusInfo: openai.BatchStatusInfo{
 				Status: openai.BatchStatusInProgress,
@@ -1616,25 +1650,27 @@ func TestPreProcess_UnregisteredModel_RejectedToErrorFile(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	if err := p.preProcessJob(ctx, jobInfo); err != nil {
+	manifest, err := p.preProcessJob(ctx, jobInfo)
+	if err != nil {
 		t.Fatalf("preProcessJob: %v", err)
 	}
 
-	// Error file should contain exactly 1 line for model-b
-	errorPath, _ := p.jobErrorFilePath(jobID, tenantID)
-	errorBytes, err := os.ReadFile(errorPath)
-	if err != nil {
-		t.Fatalf("read error file: %v", err)
+	// The rejected line carries its error-object line, which activation
+	// stores as the entry's result object.
+	var rejected []byte
+	for _, e := range manifest.Entries {
+		if e.Rejected {
+			rejected = e.ErrLine
+		}
 	}
-	errorLines := bytes.Split(bytes.TrimSpace(errorBytes), []byte{'\n'})
-	if len(errorLines) != 1 {
-		t.Fatalf("error file lines = %d, want 1", len(errorLines))
+	if rejected == nil {
+		t.Fatal("no rejected entry in the manifest")
 	}
-	if !bytes.Contains(errorLines[0], []byte(`"model_not_found"`)) {
-		t.Fatalf("error line missing model_not_found code: %s", errorLines[0])
+	if !bytes.Contains(rejected, []byte(`"model_not_found"`)) {
+		t.Fatalf("error line missing model_not_found code: %s", rejected)
 	}
-	if !bytes.Contains(errorLines[0], []byte(`"req-2"`)) {
-		t.Fatalf("error line missing custom_id req-2: %s", errorLines[0])
+	if !bytes.Contains(rejected, []byte(`"req-2"`)) {
+		t.Fatalf("error line missing custom_id req-2: %s", rejected)
 	}
 
 	// model_map.json should record 1 rejected request
@@ -1657,6 +1693,112 @@ func TestPreProcess_UnregisteredModel_RejectedToErrorFile(t *testing.T) {
 	planEntries := testReadPlanEntries(t, planPath)
 	if len(planEntries) != 2 {
 		t.Fatalf("plan entries for model-a = %d, want 2", len(planEntries))
+	}
+}
+
+// TestPreProcess_UnregisteredModel_AsyncMode_Rejected mirrors the per-model
+// sync test for async dispatch: registration is resolved by the bare model ID
+// (the key the async dispatch path uses), and the rejection lands in the
+// manifest with a stable request ID and result key so activation persists it
+// as a durable error object instead of a local error.jsonl line.
+func TestPreProcess_UnregisteredModel_AsyncMode_Rejected(t *testing.T) {
+	ctx := testLoggerCtx(t)
+
+	cfg := config.NewConfig()
+	cfg.WorkDir = t.TempDir()
+
+	dbClient := newMockBatchDBClient()
+	fileDBClient := newMockFileDBClient()
+	filesClient := mockfiles.NewMockBatchFilesClient(t.TempDir())
+
+	tenantID := "tenant__tenantA"
+	folder, _ := ucom.GetFolderNameByTenantID(tenantID)
+	filename := "input.jsonl"
+
+	lines := [][]byte{
+		[]byte(`{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"model-a","messages":[{"role":"user","content":"hi"}]}}` + "\n"),
+		[]byte(`{"custom_id":"req-2","method":"POST","url":"/v1/chat/completions","body":{"model":"model-b","messages":[{"role":"user","content":"hi"}]}}` + "\n"),
+	}
+	var remoteBuf bytes.Buffer
+	for _, ln := range lines {
+		remoteBuf.Write(ln)
+	}
+
+	inputFileID := "file-unregistered-async"
+	if _, err := filesClient.Store(ctx, ucom.FileStorageName(inputFileID, filename), folder, 0, 0, bytes.NewReader(remoteBuf.Bytes())); err != nil {
+		t.Fatalf("files.Store: %v", err)
+	}
+	fileSpec := &openai.FileObject{Filename: filename}
+	fileItem := &db.FileItem{
+		BaseIndexes:  db.BaseIndexes{ID: inputFileID, TenantID: tenantID},
+		BaseContents: db.BaseContents{Spec: mustJSON(t, fileSpec)},
+	}
+	if err := fileDBClient.DBStore(ctx, fileItem); err != nil {
+		t.Fatalf("DBStore file item: %v", err)
+	}
+
+	clients := &clientset.Clientset{
+		BatchDB: dbClient,
+		FileDB:  fileDBClient,
+		File:    filesClient,
+		AsyncInference: inference.NewTestAsyncResolver(map[string]func() inference.AsyncInferenceClient{
+			"model-a": func() inference.AsyncInferenceClient { return &fakeAsyncInferenceClient{} },
+		}),
+		Resumable: mockdb.NewMockResumableStore(),
+	}
+	p := mustNewProcessor(t, cfg, clients)
+
+	jobID := "job-unregistered-async"
+	jobInfo := &batch_types.JobInfo{
+		JobID: jobID,
+		BatchJob: &openai.Batch{
+			ID:              jobID,
+			BatchSpec:       openai.BatchSpec{InputFileID: inputFileID, Endpoint: openai.EndpointChatCompletions},
+			BatchStatusInfo: openai.BatchStatusInfo{Status: openai.BatchStatusInProgress},
+		},
+		TenantID: tenantID,
+	}
+
+	manifest, err := p.preProcessJob(ctx, jobInfo)
+	if err != nil {
+		t.Fatalf("preProcessJob: %v", err)
+	}
+
+	if len(manifest.Entries) != 2 {
+		t.Fatalf("manifest entries = %d, want 2", len(manifest.Entries))
+	}
+	if manifest.Entries[0].Rejected {
+		t.Fatal("registered model-a must not be rejected")
+	}
+	rejected := manifest.Entries[1]
+	if !rejected.Rejected {
+		t.Fatal("model-b entry must be rejected")
+	}
+	if rejected.ErrorCode != inference.ErrCodeModelNotFound {
+		t.Fatalf("error code = %s, want %s", rejected.ErrorCode, inference.ErrCodeModelNotFound)
+	}
+	wantID := stableBatchRequestID(jobID, "req-2")
+	if rejected.RequestID != wantID {
+		t.Fatalf("request ID = %s, want %s", rejected.RequestID, wantID)
+	}
+	if rejected.ResultKey != resumableResultKey(jobID, wantID) {
+		t.Fatalf("result key = %s, want %s", rejected.ResultKey, resumableResultKey(jobID, wantID))
+	}
+
+	// The model map mirrors the sync behavior: one rejection, model-b absent.
+	jobRootDir, _ := p.jobRootDir(jobID, tenantID)
+	mm, err := readModelMap(jobRootDir)
+	if err != nil {
+		t.Fatalf("readModelMap: %v", err)
+	}
+	if mm.RejectedCount != 1 {
+		t.Fatalf("RejectedCount = %d, want 1", mm.RejectedCount)
+	}
+	if _, ok := mm.ModelToSafe["model-b"]; ok {
+		t.Fatal("model-b should not appear in model map (rejected during ingestion)")
+	}
+	if _, ok := mm.ModelToSafe["model-a"]; !ok {
+		t.Fatal("model-a missing from model map")
 	}
 }
 
@@ -1727,6 +1869,7 @@ func TestPreProcess_AllRequestsUnregistered_ExecuteJobCounts(t *testing.T) {
 			ID: jobID,
 			BatchSpec: openai.BatchSpec{
 				InputFileID: inputFileID,
+				Endpoint:    openai.EndpointChatCompletions,
 			},
 			BatchStatusInfo: openai.BatchStatusInfo{
 				Status: openai.BatchStatusInProgress,
@@ -1735,18 +1878,8 @@ func TestPreProcess_AllRequestsUnregistered_ExecuteJobCounts(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	if err := p.preProcessJob(ctx, jobInfo); err != nil {
+	if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
 		t.Fatalf("preProcessJob: %v", err)
-	}
-
-	errorPath, _ := p.jobErrorFilePath(jobID, tenantID)
-	errorBytes, err := os.ReadFile(errorPath)
-	if err != nil {
-		t.Fatalf("read error file: %v", err)
-	}
-	errorLines := bytes.Split(bytes.TrimSpace(errorBytes), []byte{'\n'})
-	if len(errorLines) != 3 {
-		t.Fatalf("error file lines = %d, want 3", len(errorLines))
 	}
 
 	jobRootDir, _ := p.jobRootDir(jobID, tenantID)
@@ -1778,9 +1911,12 @@ func TestPreProcess_AllRequestsUnregistered_ExecuteJobCounts(t *testing.T) {
 		t.Fatalf("plan files = %d, want 0", planFiles)
 	}
 
+	sink, jobItem := activateJobEntries(t, p, jobID, tenantID, []string{"req-1", "req-2", "req-3"})
 	counts, execErr := p.executeJob(ctx, &jobExecutionParams{
-		updater: NewStatusUpdater(dbClient, mockdb.NewMockBatchStatusClient(), 86400),
-		jobInfo: jobInfo,
+		updater:    NewStatusUpdater(dbClient),
+		jobInfo:    jobInfo,
+		jobItem:    jobItem,
+		resultSink: sink,
 	})
 	if execErr != nil {
 		t.Fatalf("executeJob: %v", execErr)
@@ -1790,211 +1926,6 @@ func TestPreProcess_AllRequestsUnregistered_ExecuteJobCounts(t *testing.T) {
 	}
 }
 
-// TestPreProcess_ReEnqueue_TruncatesStaleErrorFile verifies that when a job is
-// re-enqueued (e.g. after pod shutdown), the next ingestion run truncates any
-// stale error.jsonl left by the previous attempt. Without truncation, execution's
-// O_APPEND would mix stale entries with fresh ones.
-func TestPreProcess_ReEnqueue_TruncatesStaleErrorFile(t *testing.T) {
-	ctx := testLoggerCtx(t)
-
-	workDir := t.TempDir()
-	cfg := config.NewConfig()
-	cfg.WorkDir = workDir
-
-	dbClient := newMockBatchDBClient()
-	fileDBClient := newMockFileDBClient()
-	filesClient := mockfiles.NewMockBatchFilesClient(t.TempDir())
-
-	tenantID := "tenant__tenantA"
-	folder, _ := ucom.GetFolderNameByTenantID(tenantID)
-	filename := "input.jsonl"
-
-	// All models are registered — no rejections expected.
-	lines := [][]byte{
-		[]byte(`{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"model-a","messages":[{"role":"user","content":"hi"}]}}` + "\n"),
-	}
-	var remoteBuf bytes.Buffer
-	for _, ln := range lines {
-		remoteBuf.Write(ln)
-	}
-
-	inputFileID := "file-reenqueue"
-	if _, err := filesClient.Store(ctx, ucom.FileStorageName(inputFileID, filename), folder, 0, 0, bytes.NewReader(remoteBuf.Bytes())); err != nil {
-		t.Fatalf("files.Store: %v", err)
-	}
-	fileSpec := &openai.FileObject{Filename: filename}
-	fileItem := &db.FileItem{
-		BaseIndexes:  db.BaseIndexes{ID: inputFileID, TenantID: tenantID},
-		BaseContents: db.BaseContents{Spec: mustJSON(t, fileSpec)},
-	}
-	if err := fileDBClient.DBStore(ctx, fileItem); err != nil {
-		t.Fatalf("DBStore file item: %v", err)
-	}
-
-	resolver, err := inference.NewPerModelResolver(
-		map[string]inference.GatewayClientConfig{
-			"model-a": {URL: "http://fake:8000"},
-		},
-		testLogger(t),
-	)
-	if err != nil {
-		t.Fatalf("NewPerModelResolver: %v", err)
-	}
-
-	clients := &clientset.Clientset{
-		BatchDB:   dbClient,
-		FileDB:    fileDBClient,
-		File:      filesClient,
-		Inference: resolver,
-	}
-	p := mustNewProcessor(t, cfg, clients)
-
-	jobID := "job-reenqueue"
-	jobInfo := &batch_types.JobInfo{
-		JobID: jobID,
-		BatchJob: &openai.Batch{
-			ID:              jobID,
-			BatchSpec:       openai.BatchSpec{InputFileID: inputFileID},
-			BatchStatusInfo: openai.BatchStatusInfo{Status: openai.BatchStatusInProgress},
-		},
-		TenantID: tenantID,
-	}
-
-	// Simulate a stale error.jsonl from a previous attempt.
-	errorPath, _ := p.jobErrorFilePath(jobID, tenantID)
-	jobRootDir, _ := p.jobRootDir(jobID, tenantID)
-	if err := os.MkdirAll(jobRootDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	if err := os.WriteFile(errorPath, []byte(`{"id":"stale","custom_id":"old","error":{"code":"stale_error","message":"from previous attempt"}}`+"\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile stale error: %v", err)
-	}
-
-	if err := p.preProcessJob(ctx, jobInfo); err != nil {
-		t.Fatalf("preProcessJob: %v", err)
-	}
-
-	// error.jsonl should be empty (truncated by ingestion, no rejections this time).
-	errorBytes, err := os.ReadFile(errorPath)
-	if err != nil {
-		t.Fatalf("read error file: %v", err)
-	}
-	if len(bytes.TrimSpace(errorBytes)) != 0 {
-		t.Fatalf("expected empty error.jsonl after re-enqueue with no rejections, got:\n%s", errorBytes)
-	}
-}
-
 // TestPreProcess_ModelNotFound_ThenEarlySLO_PreservesErrorFile verifies that
 // when ingestion writes model_not_found entries and execution hits early SLO
 // expiration, the error file is preserved (not truncated by execution).
-func TestPreProcess_ModelNotFound_ThenEarlySLO_PreservesErrorFile(t *testing.T) {
-	ctx := testLoggerCtx(t)
-
-	workDir := t.TempDir()
-	cfg := config.NewConfig()
-	cfg.WorkDir = workDir
-
-	dbClient := newMockBatchDBClient()
-	fileDBClient := newMockFileDBClient()
-	filesClient := mockfiles.NewMockBatchFilesClient(t.TempDir())
-
-	tenantID := "tenant__tenantA"
-	folder, _ := ucom.GetFolderNameByTenantID(tenantID)
-	filename := "input.jsonl"
-
-	// 2 requests: model-a (registered), model-b (NOT registered)
-	lines := [][]byte{
-		[]byte(`{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"model-a","messages":[{"role":"user","content":"hi"}]}}` + "\n"),
-		[]byte(`{"custom_id":"req-2","method":"POST","url":"/v1/chat/completions","body":{"model":"model-b","messages":[{"role":"user","content":"hi"}]}}` + "\n"),
-	}
-	var remoteBuf bytes.Buffer
-	for _, ln := range lines {
-		remoteBuf.Write(ln)
-	}
-
-	inputFileID := "file-slo-preserve"
-	if _, err := filesClient.Store(ctx, ucom.FileStorageName(inputFileID, filename), folder, 0, 0, bytes.NewReader(remoteBuf.Bytes())); err != nil {
-		t.Fatalf("files.Store: %v", err)
-	}
-	fileSpec := &openai.FileObject{Filename: filename}
-	fileItem := &db.FileItem{
-		BaseIndexes:  db.BaseIndexes{ID: inputFileID, TenantID: tenantID},
-		BaseContents: db.BaseContents{Spec: mustJSON(t, fileSpec)},
-	}
-	if err := fileDBClient.DBStore(ctx, fileItem); err != nil {
-		t.Fatalf("DBStore file item: %v", err)
-	}
-
-	resolver, err := inference.NewPerModelResolver(
-		map[string]inference.GatewayClientConfig{
-			"model-a": {URL: "http://fake:8000"},
-		},
-		testLogger(t),
-	)
-	if err != nil {
-		t.Fatalf("NewPerModelResolver: %v", err)
-	}
-
-	clients := &clientset.Clientset{
-		BatchDB:   dbClient,
-		FileDB:    fileDBClient,
-		File:      filesClient,
-		Inference: resolver,
-	}
-	p := mustNewProcessor(t, cfg, clients)
-
-	jobID := "job-slo-preserve"
-	jobInfo := &batch_types.JobInfo{
-		JobID: jobID,
-		BatchJob: &openai.Batch{
-			ID:              jobID,
-			BatchSpec:       openai.BatchSpec{InputFileID: inputFileID},
-			BatchStatusInfo: openai.BatchStatusInfo{Status: openai.BatchStatusInProgress},
-		},
-		TenantID: tenantID,
-	}
-
-	// Run ingestion — should reject model-b and write to error.jsonl.
-	if err := p.preProcessJob(ctx, jobInfo); err != nil {
-		t.Fatalf("preProcessJob: %v", err)
-	}
-
-	// Verify error.jsonl has 1 model_not_found entry before execution.
-	errorPath, _ := p.jobErrorFilePath(jobID, tenantID)
-	errorBytes, err := os.ReadFile(errorPath)
-	if err != nil {
-		t.Fatalf("read error file: %v", err)
-	}
-	errorLines := bytes.Split(bytes.TrimSpace(errorBytes), []byte{'\n'})
-	if len(errorLines) != 1 {
-		t.Fatalf("error file lines before execution = %d, want 1", len(errorLines))
-	}
-
-	// Simulate early SLO expiration: create an already-expired context.
-	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(-time.Second))
-	defer sloCancel()
-
-	counts, execErr := p.executeJob(sloCtx, &jobExecutionParams{
-		updater: NewStatusUpdater(dbClient, mockdb.NewMockBatchStatusClient(), 86400),
-		jobInfo: jobInfo,
-	})
-	if !errors.Is(execErr, batchctx.ErrExpired) {
-		t.Fatalf("expected batchctx.ErrExpired, got: %v", execErr)
-	}
-	// Failed = 2: 1 model_not_found (ingestion) + 1 batch_expired (pipeline drain for model-a).
-	if counts.Failed != 2 {
-		t.Fatalf("Failed = %d, want 2 (1 model_not_found + 1 batch_expired)", counts.Failed)
-	}
-
-	// error.jsonl should have both the model_not_found and batch_expired entries.
-	errorBytesAfter, err := os.ReadFile(errorPath)
-	if err != nil {
-		t.Fatalf("read error file after execution: %v", err)
-	}
-	if !bytes.Contains(errorBytesAfter, []byte(`"model_not_found"`)) {
-		t.Fatalf("error file lost model_not_found entry after early SLO:\n%s", errorBytesAfter)
-	}
-	if !bytes.Contains(errorBytesAfter, []byte(`"batch_expired"`)) {
-		t.Fatalf("error file missing batch_expired entry for undispatched request:\n%s", errorBytesAfter)
-	}
-}

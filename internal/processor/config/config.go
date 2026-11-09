@@ -25,11 +25,13 @@ import (
 	"time"
 
 	sharedcfg "github.com/llm-d/llm-d-batch-gateway/internal/shared/config"
+	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
 	ucom "github.com/llm-d/llm-d-batch-gateway/internal/util/com"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/ptr"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/retry"
 	inference "github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 	"gopkg.in/yaml.v3"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // ConcurrencyConfig groups all dispatch-rate and concurrency control knobs.
@@ -79,6 +81,24 @@ type DispatchMode string
 const (
 	DispatchModeSync  DispatchMode = "sync"
 	DispatchModeAsync DispatchMode = "async"
+
+	// DefaultWorkDirSizeLimit matches the default Kubernetes emptyDir sizeLimit
+	// in the Helm chart. Deployments which override that chart value must pass
+	// the same value through work_dir_size_limit.
+	DefaultWorkDirSizeLimit = "10Gi"
+
+	// DefaultInputFileDiskBudgetPercent reserves at most this proportion of the
+	// work directory for concurrently staged input files.
+	DefaultInputFileDiskBudgetPercent = 10
+
+	// DefaultNumWorkers matches the bundled processor configuration and Helm
+	// chart default. The effective count may be lower due to the input-file
+	// disk budget.
+	DefaultNumWorkers = 5
+
+	// DefaultMaxInputFileSizeBytes is the files API's default maximum input-file
+	// size. It is used unless input_file_max_size_bytes is explicitly configured.
+	DefaultMaxInputFileSizeBytes int64 = 200 << 20
 )
 
 // RouteKeyMethod selects how model_gateways lookup keys are derived from a
@@ -97,21 +117,21 @@ type AsyncModelConfig struct {
 	// InferencePoolName identifies the async dispatch pool for this model.
 	InferencePoolName string `yaml:"inference_pool_name"`
 
-	// InferenceObjective is the name of a GIE InferenceObjective CRD sent in
+	// InferenceObjective is the name of an llm-d-router InferenceObjective CRD sent in
 	// the x-gateway-inference-objective header on inference requests.
 	// When empty, the header is not sent.
 	InferenceObjective string `yaml:"inference_objective"`
 
-	// RequestQueueName overrides the Redis sorted-set queue name used to
-	// submit inference requests. When empty, the name is derived from
-	// InferencePoolName as "llm-d-async:requests:<pool>".
+	// RequestQueueName overrides the async request queue name used to submit
+	// inference requests. When empty, the name is derived from InferencePoolName
+	// as "llm-d-async:requests:<pool>".
 	// Deprecated fallback: the derived naming convention will be removed in
 	// a future release. Set explicit queue names for new deployments.
 	RequestQueueName string `yaml:"request_queue_name"`
 
-	// ResultQueueName overrides the Redis list base name used to read inference
-	// results. The Processor appends its replica identity. When empty, the base
-	// name is derived from InferencePoolName as "llm-d-async:results:<pool>".
+	// ResultQueueName overrides the async result queue base name. The Processor
+	// appends its replica identity. When empty, the base name is derived from
+	// InferencePoolName as "llm-d-async:results:<pool>".
 	// Deprecated fallback: the derived naming convention will be removed in
 	// a future release. Set an explicit queue base name for new deployments.
 	ResultQueueName string `yaml:"result_queue_name"`
@@ -120,27 +140,82 @@ type AsyncModelConfig struct {
 // AsyncDispatchConfig holds configuration for the llm-d-async dispatch backend.
 // Only used when DispatchMode == "async".
 type AsyncDispatchConfig struct {
-	// RedisURL is the full Redis connection URL (e.g. "redis://host:6379",
-	// "rediss://user:pass@host:6379" for TLS). Read from the mounted secret
-	// at runtime (SecretKeyRedisURL)
+	// Transport selects the llm-d-async queue backend. The supported values are
+	// "redis-sortedset" and "sql".
+	Transport string `yaml:"transport"`
+
+	// RedisURL is the full Redis connection URL. Read from the mounted secret
+	// at runtime when the transport is "redis-sortedset".
 	RedisURL string `yaml:"-"`
 
-	// ResultPollTimeout is the timeout per GetResult poll cycle.
-	// Controls how long each blocking poll waits before retrying.
+	// SQLURL is the PostgreSQL connection URL. It is populated from the shared
+	// database client configuration when the transport is "sql".
+	SQLURL string `yaml:"-"`
+
+	// ResultPollTimeout is the timeout per result poll cycle.
 	ResultPollTimeout time.Duration `yaml:"result_poll_timeout"`
+
+	// PollInterval controls how frequently the SQL transport checks for results.
+	PollInterval time.Duration `yaml:"poll_interval"`
+
+	// MaxConnections caps the SQL store connection pool for this processor.
+	// Only used when Transport is "sql".
+	MaxConnections int `yaml:"max_connections"`
 
 	// Models maps model names to their async dispatch targets.
 	// Required when DispatchMode == "async".
 	Models map[string]AsyncModelConfig `yaml:"models"`
 }
 
+// ResumableConfig holds the tunables of the resumable pipeline that async
+// dispatch runs on. There is no enabled flag: resumable is the only
+// implementation of async dispatch.
+type ResumableConfig struct {
+	// LeaseDuration is the ownership lease an activated batch holds in
+	// Postgres; the owner renews it at half this interval.
+	LeaseDuration time.Duration `yaml:"lease_duration"`
+
+	// FinalizeConcurrency bounds the parallel result-object fetches during
+	// resumable finalization.
+	FinalizeConcurrency int `yaml:"finalize_concurrency"`
+
+	// FinalizeTimeout bounds the finalization phase of one batch.
+	FinalizeTimeout time.Duration `yaml:"finalize_timeout"`
+
+	// RecoveryWindow bounds how long a resumed batch waits for the stranded
+	// result delivery of an in-flight entry — held under a claim lease on
+	// the previous submitter's per-processor route — before re-submitting
+	// it. It should cover the async result claim lease (default 5m): a
+	// delivery claimed just before the disruption becomes recoverable only
+	// when that lease lapses.
+	RecoveryWindow time.Duration `yaml:"recovery_window"`
+}
+
 type ProcessorConfig struct {
+	// ExtraEndpoints adds deployment-specific inference paths to the default OpenAI endpoint allowlist.
+	ExtraEndpoints []string `yaml:"extra_endpoints"`
+
 	// TaskWaitTime is the timeout parameter used when dequeueing from the priority queue
 	// This should be shorter than PollInterval
 	TaskWaitTime time.Duration `yaml:"task_wait_time"`
 
-	// NumWorkers is the fixed number of worker goroutines spawned to process jobs
+	// NumWorkers is the configured upper bound on worker goroutines processing jobs.
 	NumWorkers int `yaml:"num_workers"`
+
+	// WorkDirSizeLimit is the capacity allocated to the processor work directory.
+	// In Kubernetes it must match processor.workDirVolume.sizeLimit. The runtime
+	// cannot derive an emptyDir quota from the mounted filesystem.
+	WorkDirSizeLimit string `yaml:"work_dir_size_limit"`
+
+	// InputFileDiskBudgetPercent is the maximum percentage of WorkDirSizeLimit
+	// available for concurrently staged input files. The effective worker count
+	// is capped by this budget and MaxInputFileSizeBytes.
+	InputFileDiskBudgetPercent int `yaml:"input_file_disk_budget_percent"`
+
+	// MaxInputFileSizeBytes must match the maximum input-file size accepted by
+	// the files API. It keeps the worker cap conservative when that API limit is
+	// overridden from its default.
+	MaxInputFileSizeBytes int64 `yaml:"input_file_max_size_bytes"`
 
 	// Concurrency groups all dispatch-rate and concurrency control settings.
 	Concurrency ConcurrencyConfig `yaml:"concurrency"`
@@ -198,8 +273,8 @@ type ProcessorConfig struct {
 	// 0 means no expiration (keep until explicitly deleted).
 	DefaultOutputExpirationSeconds int64 `yaml:"default_output_expiration_seconds"`
 
-	// ProgressTTLSeconds is the TTL for temporary progress updates in the status store (Redis).
-	ProgressTTLSeconds int `yaml:"progress_ttl_seconds"`
+	// ProgressUpdateInterval is the throttling interval between intermediate progress updates to the DB.
+	ProgressUpdateInterval time.Duration `yaml:"progress_update_interval"`
 
 	// SendFairnessHeader controls whether the processor sends
 	// x-gateway-inference-fairness-id on inference requests.
@@ -222,6 +297,10 @@ type ProcessorConfig struct {
 
 	// AsyncDispatchConfig holds llm-d-async dispatch settings. Only used when DispatchMode == "async".
 	AsyncDispatchConfig AsyncDispatchConfig `yaml:"async_dispatch"`
+
+	// Resumable holds the tunables of the resumable pipeline that async
+	// dispatch runs on.
+	Resumable ResumableConfig `yaml:"resumable"`
 }
 
 // ModelGatewayConfig describes the full gateway and HTTP/TLS settings for one
@@ -243,9 +322,9 @@ type ModelGatewayConfig struct {
 	APIKeyName string `yaml:"api_key_name"`
 	APIKeyFile string `yaml:"api_key_file"`
 
-	// InferenceObjective is the name of a GIE InferenceObjective CRD sent in
+	// InferenceObjective is the name of an llm-d-router InferenceObjective CRD sent in
 	// the x-gateway-inference-objective header on inference requests. Use this
-	// to target per-model InferencePools in multi-pool GIE deployments.
+	// to target per-model InferencePools in multi-pool Router EPP deployments.
 	// When empty, the header is not sent.
 	InferenceObjective string `yaml:"inference_objective"`
 
@@ -309,8 +388,8 @@ func (pc *ProcessorConfig) LoadFromYAML(filePath string) error {
 }
 
 // NewConfig returns a new ProcessorConfig with default values.
-// Gateway fields (GlobalInferenceGateway, ModelGateways) are intentionally
-// left nil — the user must configure exactly one via YAML or env.
+// Dispatch targets are intentionally left nil: configure a global or per-model
+// gateway, or explicitly select async and configure async_dispatch.models.
 // TaskWaitTime has to be shorter than poll interval.
 func NewConfig() *ProcessorConfig {
 	return &ProcessorConfig{
@@ -343,8 +422,11 @@ func NewConfig() *ProcessorConfig {
 				AdditiveIncrease: 1,
 			},
 		},
-		NumWorkers: 1,
-		Addr:       ":9090",
+		NumWorkers:                 DefaultNumWorkers,
+		WorkDirSizeLimit:           DefaultWorkDirSizeLimit,
+		InputFileDiskBudgetPercent: DefaultInputFileDiskBudgetPercent,
+		MaxInputFileSizeBytes:      DefaultMaxInputFileSizeBytes,
+		Addr:                       ":9090",
 		// Keep observability as best-effort by default.
 		TerminateOnObservabilityFailure: false,
 		ShutdownTimeout:                 30 * time.Second,
@@ -361,11 +443,20 @@ func NewConfig() *ProcessorConfig {
 			},
 		},
 		DefaultOutputExpirationSeconds: 90 * 24 * 60 * 60, // 90 days
-		ProgressTTLSeconds:             24 * 60 * 60,      // 24 hours
+		ProgressUpdateInterval:         15 * time.Second,  // 15 seconds
 
 		DispatchMode: DispatchModeSync,
 		AsyncDispatchConfig: AsyncDispatchConfig{
+			Transport:         inference.AsyncTransportRedisSortedSet,
+			MaxConnections:    inference.DefaultSQLMaxConns,
 			ResultPollTimeout: 5 * time.Second,
+			PollInterval:      time.Second,
+		},
+		Resumable: ResumableConfig{
+			LeaseDuration:       5 * time.Minute,
+			FinalizeConcurrency: 16,
+			FinalizeTimeout:     30 * time.Minute,
+			RecoveryWindow:      5 * time.Minute,
 		},
 	}
 }
@@ -382,6 +473,9 @@ func (c *ProcessorConfig) Validate() error {
 	}
 	if c.NumWorkers <= 0 {
 		return fmt.Errorf("num_workers must be > 0")
+	}
+	if _, err := c.EffectiveNumWorkers(); err != nil {
+		return err
 	}
 
 	if err := c.Concurrency.validate(); err != nil {
@@ -411,9 +505,23 @@ func (c *ProcessorConfig) Validate() error {
 	if err := c.FileClientCfg.Retry.Validate(); err != nil {
 		return fmt.Errorf("file_client.retry: %w", err)
 	}
+	if _, err := openai.NewEndpointAllowlist(c.ExtraEndpoints); err != nil {
+		return fmt.Errorf("extra_endpoints: %w", err)
+	}
 
-	if c.ProgressTTLSeconds <= 0 {
-		return fmt.Errorf("progress_ttl_seconds must be > 0")
+	// The lease is persisted in Postgres as whole seconds; a sub-second
+	// duration truncates to an already-expired lease.
+	if c.Resumable.LeaseDuration < time.Second || c.Resumable.LeaseDuration%time.Second != 0 {
+		return fmt.Errorf("resumable.lease_duration must be a whole number of seconds >= 1s, got %s", c.Resumable.LeaseDuration)
+	}
+	if c.Resumable.FinalizeConcurrency <= 0 {
+		return fmt.Errorf("resumable.finalize_concurrency must be > 0")
+	}
+	if c.Resumable.FinalizeTimeout <= 0 {
+		return fmt.Errorf("resumable.finalize_timeout must be > 0")
+	}
+	if c.Resumable.RecoveryWindow <= 0 {
+		return fmt.Errorf("resumable.recovery_window must be > 0")
 	}
 
 	switch c.RouteKeyMethod {
@@ -427,6 +535,48 @@ func (c *ProcessorConfig) Validate() error {
 	}
 
 	return nil
+}
+
+// EffectiveNumWorkers returns the number of jobs which can safely stage their
+// maximum-size input files concurrently. It caps the configured worker count by
+// the work-directory budget reserved for input files.
+func (c *ProcessorConfig) EffectiveNumWorkers() (int, error) {
+	if c.NumWorkers <= 0 {
+		return 0, fmt.Errorf("num_workers must be > 0")
+	}
+	if c.InputFileDiskBudgetPercent <= 0 || c.InputFileDiskBudgetPercent > 100 {
+		return 0, fmt.Errorf("input_file_disk_budget_percent must be in [1, 100]")
+	}
+	if c.MaxInputFileSizeBytes <= 0 {
+		return 0, fmt.Errorf("input_file_max_size_bytes must be > 0")
+	}
+	if c.WorkDirSizeLimit == "" {
+		return 0, fmt.Errorf("work_dir_size_limit cannot be empty")
+	}
+
+	quantity, err := resource.ParseQuantity(c.WorkDirSizeLimit)
+	if err != nil {
+		return 0, fmt.Errorf("parse work_dir_size_limit %q: %w", c.WorkDirSizeLimit, err)
+	}
+	workDirBytes := quantity.Value()
+	if workDirBytes <= 0 {
+		return 0, fmt.Errorf("work_dir_size_limit must be > 0")
+	}
+
+	// Calculate without multiplying workDirBytes by the percentage, which could
+	// overflow for an otherwise valid Kubernetes quantity.
+	inputBudgetBytes := (workDirBytes/100)*int64(c.InputFileDiskBudgetPercent) +
+		(workDirBytes%100)*int64(c.InputFileDiskBudgetPercent)/100
+	maxWorkersByDisk := inputBudgetBytes / c.MaxInputFileSizeBytes
+	if maxWorkersByDisk < 1 {
+		return 0, fmt.Errorf("input file disk budget (%d bytes) must fit one maximum-size input file (%d bytes)", inputBudgetBytes, c.MaxInputFileSizeBytes)
+	}
+	if int64(c.NumWorkers) <= maxWorkersByDisk {
+		return c.NumWorkers, nil
+	}
+	// This conversion is safe: this branch guarantees maxWorkersByDisk is less
+	// than NumWorkers, which is already an int.
+	return int(maxWorkersByDisk), nil
 }
 
 func (c *ProcessorConfig) validateGateways() error {
@@ -462,14 +612,24 @@ func (c *ProcessorConfig) validateSyncDispatchConfig() error {
 }
 
 func (c *ProcessorConfig) validateAsyncDispatchConfig() error {
+	transport, err := inference.NormalizeAsyncTransport(c.AsyncDispatchConfig.Transport)
+	if err != nil {
+		return fmt.Errorf("async_dispatch.transport: %w", err)
+	}
+	if transport == inference.AsyncTransportSQL && c.AsyncDispatchConfig.MaxConnections <= 0 {
+		return fmt.Errorf("async_dispatch.max_connections must be > 0")
+	}
 	if c.AsyncDispatchConfig.ResultPollTimeout <= 0 {
 		return fmt.Errorf("async_dispatch.result_poll_timeout must be > 0")
 	}
+	if c.AsyncDispatchConfig.PollInterval <= 0 {
+		return fmt.Errorf("async_dispatch.poll_interval must be > 0")
+	}
 	if c.GlobalInferenceGateway != nil {
-		return fmt.Errorf("global_inference_gateway is not supported with dispatch_mode %q; use async_dispatch.models", DispatchModeAsync)
+		return fmt.Errorf("global_inference_gateway is not supported with dispatch_mode %q; use async_dispatch.models instead or explicitly set dispatch_mode: sync", DispatchModeAsync)
 	}
 	if len(c.AsyncDispatchConfig.Models) == 0 {
-		return fmt.Errorf("async_dispatch.models must be configured when dispatch_mode is %q", DispatchModeAsync)
+		return fmt.Errorf("async_dispatch.models must be configured when dispatch_mode is %q; configure async mappings or explicitly set dispatch_mode: sync to use global_inference_gateway or model_gateways", DispatchModeAsync)
 	}
 	for model, m := range c.AsyncDispatchConfig.Models {
 		if m.InferencePoolName == "" {
@@ -614,7 +774,7 @@ type ResolvedGateways struct {
 
 // ResolveModelGateways resolves API keys for all configured gateways and returns
 // a ResolvedGateways ready to pass to the inference client resolver.
-// Validate() ensures exactly one of GlobalInferenceGateway or ModelGateways is set.
+// Validate() ensures dispatch targets are configured for the selected mode.
 func ResolveModelGateways(cfg *ProcessorConfig) (*ResolvedGateways, error) {
 	result := &ResolvedGateways{}
 
@@ -628,8 +788,11 @@ func ResolveModelGateways(cfg *ProcessorConfig) (*ResolvedGateways, error) {
 			}
 		}
 		result.Async = &inference.AsyncClientConfig{
+			Transport:         cfg.AsyncDispatchConfig.Transport,
+			MaxConnections:    cfg.AsyncDispatchConfig.MaxConnections,
 			Models:            models,
 			ResultPollTimeout: cfg.AsyncDispatchConfig.ResultPollTimeout,
+			PollInterval:      cfg.AsyncDispatchConfig.PollInterval,
 		}
 		return result, nil
 	}

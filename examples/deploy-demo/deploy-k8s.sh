@@ -52,7 +52,7 @@ MODEL_ROUTES=(
     "${MODEL_NAME}:${LLMD_POOL_NAME}"
 )
 
-# Flow control: GIE priority-based dispatch (interactive > batch).
+# Flow control: Router EPP priority-based dispatch (interactive > batch).
 # When enabled, EPP is configured with flow control plugins and InferenceObjective
 # CRDs are created so batch requests are sheddable (priority -1) while interactive
 # requests get priority 100.
@@ -62,10 +62,10 @@ BATCH_FLOW_CONTROL_OBJECTIVE="${BATCH_FLOW_CONTROL_OBJECTIVE:-batch-sheddable}"
 
 # Async dispatcher (llm-d-async) — ENABLE_DISPATCHER is set in common.sh
 DISPATCHER_RELEASE="${DISPATCHER_RELEASE:-dispatcher}"
-DISPATCHER_VERSION="${DISPATCHER_VERSION:-v0.7.3}"
-DISPATCHER_IMAGE="${DISPATCHER_IMAGE:-ghcr.io/llm-d-incubation/llm-d-async:${DISPATCHER_VERSION}}"
-DISPATCHER_CHART="${DISPATCHER_CHART:-oci://ghcr.io/llm-d-incubation/charts/async-processor}"
-DISPATCHER_CHART_VERSION="${DISPATCHER_CHART_VERSION:-0.7.3}"
+DISPATCHER_VERSION="${DISPATCHER_VERSION:-v1.0.0}"
+DISPATCHER_IMAGE="${DISPATCHER_IMAGE:-ghcr.io/llm-d/llm-d-async:${DISPATCHER_VERSION}}"
+DISPATCHER_CHART="${DISPATCHER_CHART:-oci://ghcr.io/llm-d/charts/llm-d-async}"
+DISPATCHER_CHART_VERSION="${DISPATCHER_CHART_VERSION:-v1.0.0}"
 
 # ── Infrastructure ────────────────────────────────────────────────────────────
 
@@ -492,25 +492,25 @@ deploy_llmd_model() {
 create_inference_objectives() {
     step "Creating InferenceObjective resources..."
     kubectl apply -f - <<EOF
-apiVersion: llm-d.ai/v1alpha2
+apiVersion: llm-d.ai/v1
 kind: InferenceObjective
 metadata:
   name: ${INTERACTIVE_FLOW_CONTROL_OBJECTIVE}
   namespace: ${LLM_NAMESPACE}
 spec:
   priority: 100
-  poolRef:
-    name: ${LLMD_POOL_NAME}
+  poolRefs:
+    - name: ${LLMD_POOL_NAME}
 ---
-apiVersion: llm-d.ai/v1alpha2
+apiVersion: llm-d.ai/v1
 kind: InferenceObjective
 metadata:
   name: ${BATCH_FLOW_CONTROL_OBJECTIVE}
   namespace: ${LLM_NAMESPACE}
 spec:
   priority: -1
-  poolRef:
-    name: ${LLMD_POOL_NAME}
+  poolRefs:
+    - name: ${LLMD_POOL_NAME}
 EOF
     log "InferenceObjectives created (${INTERACTIVE_FLOW_CONTROL_OBJECTIVE}: priority 100, ${BATCH_FLOW_CONTROL_OBJECTIVE}: priority -1)."
 }
@@ -802,16 +802,17 @@ deploy_dispatcher() {
     cat > "${values_file}" <<YAML
 ap:
   imagePullPolicy: IfNotPresent
-  messageQueueImpl: "redis-sortedset"
+  transport: "redis-sortedset"
   concurrency: 1
   prometheusURL: "${prometheus_url}"
   prometheusCacheTTL: "0s"
-  redis:
-    enabled: true
-    url: "${redis_url}"
-    pollIntervalMs: 500
-    batchSize: 10
-    queuesConfig:
+  transportConfig:
+    urlSecret:
+      url: "${redis_url}"
+    result_queue_name: "result-list"
+    poll_interval_ms: 500
+    batch_size: 10
+    queues:
       - queue_name: "llm-d-async:requests:${LLMD_POOL_NAME}"
         request_path_url: "/v1/chat/completions"
         igw_base_url: "${igw_base_url}"
@@ -844,7 +845,7 @@ YAML
 
     rm -f "${values_file}"
 
-    wait_for_deployment "${DISPATCHER_RELEASE}-async-processor" "${BATCH_NAMESPACE}" 120s
+    wait_for_deployment "${DISPATCHER_RELEASE}-llm-d-async" "${BATCH_NAMESPACE}" 120s
 
     log "Async dispatcher deployed."
 }
@@ -861,7 +862,7 @@ verify_dispatcher_config() {
     # 1. Processor dispatch mode
     step "Checking batch processor dispatch mode..."
     local dispatch_mode
-    dispatch_mode=$(echo "${config_yaml}" | yq '.dispatch_mode // "sync"')
+    dispatch_mode=$(echo "${config_yaml}" | yq '.dispatch_mode // ""')
     if [ "${dispatch_mode}" = "async" ]; then
         log "Processor configured with dispatch_mode: async"
     else
@@ -871,17 +872,32 @@ verify_dispatcher_config() {
 
     # 2. Processor inferencePoolName
     step "Checking batch processor inferencePoolName..."
+    local models_path=".async_dispatch.models"
+    case "${BATCH_RELEASE_VERSION}" in
+        v0.3.0|v0.4.0) models_path=".model_gateways" ;;
+    esac
     local pool_name
-    pool_name=$(echo "${config_yaml}" | yq ".model_gateways.${MODEL_NAME}.inference_pool_name // \"\"")
-    if [ -n "${pool_name}" ]; then
+    pool_name=$(echo "${config_yaml}" | MODEL_NAME="${MODEL_NAME}" yq "${models_path}[strenv(MODEL_NAME)].inference_pool_name // \"\"")
+    if [ "${pool_name}" = "${LLMD_POOL_NAME}" ]; then
         log "Processor inference_pool_name: ${pool_name}"
     else
-        warn "Processor missing inference_pool_name for model '${MODEL_NAME}'"
+        warn "Processor inference_pool_name for model '${MODEL_NAME}' is '${pool_name}', expected '${LLMD_POOL_NAME}'"
         errors=$((errors + 1))
     fi
 
+    if [ "${ENABLE_FLOW_CONTROL}" = "true" ]; then
+        local objective
+        objective=$(echo "${config_yaml}" | MODEL_NAME="${MODEL_NAME}" yq "${models_path}[strenv(MODEL_NAME)].inference_objective // \"\"")
+        if [ "${objective}" = "${BATCH_FLOW_CONTROL_OBJECTIVE}" ]; then
+            log "Processor inference_objective: ${objective}"
+        else
+            warn "Processor inference_objective for model '${MODEL_NAME}' is '${objective}', expected '${BATCH_FLOW_CONTROL_OBJECTIVE}'"
+            errors=$((errors + 1))
+        fi
+    fi
+
     # 3. Async-processor started successfully
-    local ap_deploy="${DISPATCHER_RELEASE}-async-processor"
+    local ap_deploy="${DISPATCHER_RELEASE}-llm-d-async"
     step "Checking async-processor startup logs..."
     local ap_logs
     ap_logs=$(kubectl logs "deployment/${ap_deploy}" -n "${BATCH_NAMESPACE}" 2>/dev/null || echo "")
@@ -905,17 +921,23 @@ verify_dispatcher_config() {
 deploy_batch_gateway_k8s() {
     banner "Installing Batch Gateway"
 
-    local model_key="${MODEL_NAME}"
+    local model_key="${MODEL_NAME//./\\.}"
+    local model_config="processor.config.modelGateways"
     local helm_args=(
         --set "apiserver.config.batchAPI.passThroughHeaders={Authorization}"
     )
 
     if [ "${ENABLE_DISPATCHER}" = "true" ]; then
         # Async dispatch: processor sends requests via Redis to async-processor
+        model_config="processor.config.asyncDispatch.models"
+        # These released charts predate asyncDispatch.models.
+        case "${BATCH_RELEASE_VERSION}" in
+            v0.3.0|v0.4.0) model_config="processor.config.modelGateways" ;;
+        esac
         helm_args+=(
             --set "processor.config.dispatchMode=async"
             --set "processor.config.asyncDispatch.resultPollTimeout=30s"
-            --set "processor.config.modelGateways.${model_key}.inferencePoolName=${LLMD_POOL_NAME}"
+            --set "${model_config}.${model_key}.inferencePoolName=${LLMD_POOL_NAME}"
         )
         log "Async dispatch enabled: processor will route through llm-d-async (pool: ${LLMD_POOL_NAME})"
     else
@@ -929,6 +951,7 @@ deploy_batch_gateway_k8s() {
         log "Model URL (via Internal Gateway): ${model_url}"
 
         helm_args+=(
+            --set "processor.config.dispatchMode=sync"
             --set "processor.config.modelGateways.${model_key}.url=${model_url}"
             --set "processor.config.modelGateways.${model_key}.requestTimeout=${GW_REQUEST_TIMEOUT}"
             --set "processor.config.modelGateways.${model_key}.maxRetries=${GW_MAX_RETRIES}"
@@ -939,7 +962,7 @@ deploy_batch_gateway_k8s() {
 
     if [ "${ENABLE_FLOW_CONTROL}" = "true" ]; then
         helm_args+=(
-            --set "processor.config.modelGateways.${model_key}.inferenceObjective=${BATCH_FLOW_CONTROL_OBJECTIVE}"
+            --set "${model_config}.${model_key}.inferenceObjective=${BATCH_FLOW_CONTROL_OBJECTIVE}"
         )
         log "Flow control: processor will send x-gateway-inference-objective: ${BATCH_FLOW_CONTROL_OBJECTIVE}"
     fi
@@ -1094,6 +1117,14 @@ check_prerequisites() {
 cmd_install() {
     banner "llm-d + Batch Gateway Setup"
 
+    case "${BATCH_RELEASE_VERSION}" in
+        v0.1.0|v0.2.0)
+            if [ "${ENABLE_DISPATCHER}" = "true" ]; then
+                die "${BATCH_RELEASE_VERSION} does not support async dispatch. Set ENABLE_DISPATCHER=false or use a newer chart."
+            fi
+            ;;
+    esac
+
     check_prerequisites
 
     local namespaces=("${BATCH_NAMESPACE}" "${LLM_NAMESPACE}" "${GATEWAY_NAMESPACE}")
@@ -1229,7 +1260,7 @@ EOF
         || test_failures=$?
 
     if [ "${ENABLE_DISPATCHER}" = "true" ]; then
-        verify_dispatcher_runtime "${DISPATCHER_RELEASE}-async-processor" "${LLMD_POOL_NAME}"
+        verify_dispatcher_runtime "${DISPATCHER_RELEASE}-llm-d-async" "${LLMD_POOL_NAME}"
     fi
 
     if [ "${ENABLE_FLOW_CONTROL}" = "true" ]; then
@@ -1277,7 +1308,7 @@ cmd_uninstall() {
     helm uninstall "${BATCH_INSTANCE_NAME}" -n "${BATCH_NAMESPACE}" --timeout 60s 2>/dev/null || true
     helm uninstall "${BATCH_REDIS_RELEASE}" -n "${BATCH_NAMESPACE}" --timeout 60s 2>/dev/null || true
     helm uninstall "${BATCH_POSTGRESQL_RELEASE}" -n "${BATCH_NAMESPACE}" --timeout 60s 2>/dev/null || true
-    kubectl delete deployment,svc -l app="${BATCH_MINIO_RELEASE}" -n "${BATCH_NAMESPACE}" 2>/dev/null || true
+    kubectl delete deployment,svc -l app="${BATCH_S3_STORE_RELEASE}" -n "${BATCH_NAMESPACE}" 2>/dev/null || true
     kubectl delete pvc "${BATCH_FILES_PVC_NAME}" -n "${BATCH_NAMESPACE}" 2>/dev/null || true
 
     step "Removing Gateways (${GATEWAY_NAMESPACE})..."
@@ -1357,10 +1388,10 @@ usage() {
     echo "  GATEWAY_LOCAL_PORT     Port-forward fallback port (default: 8080)"
     echo "  BATCH_DEV_VERSION      Batch gateway image tag / commit SHA (default: local)"
     echo "  BATCH_RELEASE_VERSION  Install released OCI chart (e.g. v1.0.0)"
-    echo "  ENABLE_FLOW_CONTROL   Enable GIE flow control (default: true)"
+    echo "  ENABLE_FLOW_CONTROL   Enable Router EPP flow control (default: true)"
     echo "  BATCH_FLOW_CONTROL_OBJECTIVE InferenceObjective name for batch (default: batch-sheddable)"
-    echo "  ENABLE_DISPATCHER      Deploy llm-d-async dispatcher for async dispatch (default: false)"
-    echo "  DISPATCHER_VERSION     llm-d-async version (default: v0.7.3)"
+    echo "  ENABLE_DISPATCHER      Use normal HTTP sync by default (false); true opts into async dispatch"
+    echo "  DISPATCHER_VERSION     llm-d-async version (default: v1.0.0)"
     echo "  UNINSTALL_ALL          Set to 1 to also remove Kuadrant/Istio/cert-manager and CRDs (ephemeral clusters only)"
     echo ""
     echo "Examples:"

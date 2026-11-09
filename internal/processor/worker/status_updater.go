@@ -32,16 +32,12 @@ import (
 )
 
 type StatusUpdater struct {
-	db             db.BatchDBClient
-	status         db.BatchStatusClient
-	progressTTLSec int
+	db db.BatchProgressDBClient
 }
 
-func NewStatusUpdater(db db.BatchDBClient, status db.BatchStatusClient, progressTTLSec int) *StatusUpdater {
+func NewStatusUpdater(db db.BatchProgressDBClient) *StatusUpdater {
 	return &StatusUpdater{
-		db:             db,
-		status:         status,
-		progressTTLSec: progressTTLSec,
+		db: db,
 	}
 }
 
@@ -49,31 +45,27 @@ func (s *StatusUpdater) validate() error {
 	if s.db == nil {
 		return fmt.Errorf("database client is missing")
 	}
-	if s.status == nil {
-		return fmt.Errorf("status client is missing")
-	}
 	return nil
 }
 
-// UpdateProgressCounts pushes request counts to the volatile status store (e.g. Redis).
-// This is NOT a persistent DB update — it is a lightweight, frequent update used to power
-// real-time progress polling. The data expires after progressTTLSec.
+// UpdateProgressCounts updates the in-flight request counts directly in the
+// database, fenced by the job's epoch so a fenced-out processor incarnation
+// cannot overwrite the current owner's counts.
 func (s *StatusUpdater) UpdateProgressCounts(
 	ctx context.Context,
 	jobID string,
+	epoch int64,
 	requestCounts *openai.BatchRequestCounts,
 ) error {
 	if requestCounts == nil {
 		return fmt.Errorf("requestCounts is nil")
 	}
 
-	// light payload for frequent updates
-	payload := []byte(fmt.Sprintf(`{"total": %d, "completed": %d, "failed": %d}`, requestCounts.Total, requestCounts.Completed, requestCounts.Failed))
-
-	if err := s.status.StatusSet(ctx, jobID, s.progressTTLSec, payload); err != nil {
-		return err
+	countsJSON, err := json.Marshal(requestCounts)
+	if err != nil {
+		return fmt.Errorf("marshal request counts: %w", err)
 	}
-	return nil
+	return s.db.DBUpdateProgress(ctx, jobID, epoch, countsJSON)
 }
 
 // UpdatePersistentStatus writes the job status to the persistent database (e.g. PostgreSQL).
@@ -87,30 +79,57 @@ func (s *StatusUpdater) UpdatePersistentStatus(
 	slo *time.Time,
 	modifiers ...func(*openai.BatchStatusInfo),
 ) error {
+	return s.updatePersistentStatus(ctx, dbJob, newStatus, counts, slo, nil, modifiers...)
+}
+
+// BuildStatus derives the marshaled status document of one transition from
+// dbJob's current status: validation, the timestamp/counts build, then the
+// modifiers. It performs no write — both the row-store update path and the
+// fenced resumable finalization build their documents with it, so the two
+// write the same shape.
+func (s *StatusUpdater) BuildStatus(
+	dbJob *db.BatchItem,
+	newStatus openai.BatchStatus,
+	counts *openai.BatchRequestCounts,
+	slo *time.Time,
+	modifiers ...func(*openai.BatchStatusInfo),
+) ([]byte, error) {
 	if dbJob == nil {
-		return fmt.Errorf("dbJob is nil")
+		return nil, fmt.Errorf("dbJob is nil")
 	}
 	if len(dbJob.Status) == 0 {
-		return fmt.Errorf("dbJob.Status is empty")
+		return nil, fmt.Errorf("dbJob.Status is empty")
 	}
 
 	var original openai.BatchStatusInfo
 	if err := json.Unmarshal(dbJob.Status, &original); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Build base status first (status, timestamps, counts), then apply modifiers
 	// to set additional fields (e.g. file IDs) that aren't part of the standard transition.
 	updated, err := batch_utils.BuildUpdatedStatusInfo(&original, newStatus, counts, slo)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	for _, fn := range modifiers {
 		fn(updated)
 	}
 
-	statusBytes, err := json.Marshal(updated)
+	return json.Marshal(updated)
+}
+
+func (s *StatusUpdater) updatePersistentStatus(
+	ctx context.Context,
+	dbJob *db.BatchItem,
+	newStatus openai.BatchStatus,
+	counts *openai.BatchRequestCounts,
+	slo *time.Time,
+	expectedStatus []byte,
+	modifiers ...func(*openai.BatchStatusInfo),
+) error {
+	statusBytes, err := s.BuildStatus(dbJob, newStatus, counts, slo, modifiers...)
 	if err != nil {
 		return err
 	}
@@ -122,8 +141,9 @@ func (s *StatusUpdater) UpdatePersistentStatus(
 		BaseContents: db.BaseContents{
 			Status: statusBytes,
 		},
-		Epoch: dbJob.Epoch,
-	}, nil); err != nil {
+		Epoch:             dbJob.Epoch,
+		ExpectedResumable: dbJob.ExpectedResumable,
+	}, expectedStatus); err != nil {
 		return err
 	}
 
@@ -173,7 +193,10 @@ func (s *StatusUpdater) UpdateFailedStatus(
 	outputFileID string,
 	errorFileID string,
 ) error {
-	return s.UpdatePersistentStatus(ctx, dbJob, openai.BatchStatusFailed, counts, nil,
+	if dbJob == nil {
+		return fmt.Errorf("dbJob is nil")
+	}
+	return s.updatePersistentStatus(ctx, dbJob, openai.BatchStatusFailed, counts, nil, dbJob.Status,
 		withFileIDs(outputFileID, errorFileID),
 	)
 }

@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pashagolub/pgxmock/v4"
+	"github.com/pashagolub/pgxmock/v5"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 )
@@ -72,7 +72,7 @@ func TestBatchStore(t *testing.T) {
 		item := newTestBatchItem("batch-1", testTenantID)
 
 		mock.ExpectExec("INSERT INTO "+testTable).
-			WithArgs("batch-1", testTenantID, pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+			WithArgs("batch-1", testTenantID, pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 			WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
 		if err := client.DBStore(ctx, item); err != nil {
@@ -116,9 +116,10 @@ func TestBatchGet(t *testing.T) {
 
 		item := newTestBatchItem("batch-1", testTenantID)
 		tags, _ := packTags(item.Tags)
+		lease := time.Now().Add(time.Hour).Truncate(time.Microsecond)
 
-		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colStatus, colSpec}).
-			AddRow(item.ID, item.TenantID, item.Expiry, &tags, "", int64(0), int64(0), int64(0), item.Status, item.Spec)
+		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colResumable, colOwnerLeaseExpiryAt, colStatus, colSpec}).
+			AddRow(item.ID, item.TenantID, item.Expiry, &tags, "", int64(0), int64(0), int64(0), true, lease, item.Status, item.Spec)
 
 		// The SQL LIMIT is limit+1 because get() fetches an extra row to determine
 		// if more results exist beyond the requested page.
@@ -141,6 +142,12 @@ func TestBatchGet(t *testing.T) {
 		if items[0].TenantID != testTenantID {
 			t.Errorf("expected tenant %s, got %s", testTenantID, items[0].TenantID)
 		}
+		if !items[0].Resumable {
+			t.Error("expected resumable marker to be returned")
+		}
+		if !items[0].OwnerLeaseExpiresAt.Equal(lease) {
+			t.Errorf("expected owner lease %v to be returned, got %v", lease, items[0].OwnerLeaseExpiresAt)
+		}
 		if cursor != 1 || expectMore {
 			t.Errorf("unexpected pagination: cursor=%d, expectMore=%v", cursor, expectMore)
 		}
@@ -157,8 +164,8 @@ func TestBatchGet(t *testing.T) {
 		item := newTestBatchItem("batch-1", testTenantID)
 		tags, _ := packTags(item.Tags)
 
-		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colStatus}).
-			AddRow(item.ID, item.TenantID, item.Expiry, &tags, "", int64(0), int64(0), int64(0), item.Status)
+		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colResumable, colOwnerLeaseExpiryAt, colStatus}).
+			AddRow(item.ID, item.TenantID, item.Expiry, &tags, "", int64(0), int64(0), int64(0), false, nil, item.Status)
 
 		mock.ExpectQuery("SELECT .+ FROM "+testTable+" WHERE").
 			WithArgs(testTenantID, 0, 11).
@@ -191,9 +198,9 @@ func TestBatchGet(t *testing.T) {
 		tags1, _ := packTags(item1.Tags)
 		tags2, _ := packTags(item2.Tags)
 
-		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colStatus, colSpec}).
-			AddRow(item1.ID, item1.TenantID, item1.Expiry, &tags1, "", int64(0), int64(0), int64(0), item1.Status, item1.Spec).
-			AddRow(item2.ID, item2.TenantID, item2.Expiry, &tags2, "", int64(0), int64(0), int64(0), item2.Status, item2.Spec)
+		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colResumable, colOwnerLeaseExpiryAt, colStatus, colSpec}).
+			AddRow(item1.ID, item1.TenantID, item1.Expiry, &tags1, "", int64(0), int64(0), int64(0), false, nil, item1.Status, item1.Spec).
+			AddRow(item2.ID, item2.TenantID, item2.Expiry, &tags2, "", int64(0), int64(0), int64(0), false, nil, item2.Status, item2.Spec)
 
 		mock.ExpectQuery("SELECT .+ FROM "+testTable+" WHERE").
 			WithArgs([]string{"batch-1", "batch-2"}, 0, 11).
@@ -222,8 +229,8 @@ func TestBatchGet(t *testing.T) {
 		item.Tags = api.Tags{"env": "prod", "team": "ml"}
 		tags, _ := packTags(item.Tags)
 
-		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colStatus, colSpec}).
-			AddRow(item.ID, item.TenantID, item.Expiry, &tags, "", int64(0), int64(0), int64(0), item.Status, item.Spec)
+		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colResumable, colOwnerLeaseExpiryAt, colStatus, colSpec}).
+			AddRow(item.ID, item.TenantID, item.Expiry, &tags, "", int64(0), int64(0), int64(0), false, nil, item.Status, item.Spec)
 
 		mock.ExpectQuery("SELECT .+ FROM "+testTable+" WHERE").
 			WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), 0, 11).
@@ -254,8 +261,8 @@ func TestBatchGet(t *testing.T) {
 		item := newTestBatchItem("batch-1", testTenantID)
 		tags, _ := packTags(item.Tags)
 
-		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colStatus, colSpec}).
-			AddRow(item.ID, item.TenantID, item.Expiry, &tags, "", int64(0), int64(0), int64(0), item.Status, item.Spec)
+		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colResumable, colOwnerLeaseExpiryAt, colStatus, colSpec}).
+			AddRow(item.ID, item.TenantID, item.Expiry, &tags, "", int64(0), int64(0), int64(0), false, nil, item.Status, item.Spec)
 
 		mock.ExpectQuery("SELECT .+ FROM "+testTable+" WHERE .+NOT IN").
 			WithArgs(0, 11).
@@ -283,8 +290,8 @@ func TestBatchGet(t *testing.T) {
 		item := newTestBatchItem("batch-1", testTenantID)
 		tags, _ := packTags(item.Tags)
 
-		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colStatus, colSpec}).
-			AddRow(item.ID, item.TenantID, item.Expiry, &tags, "", int64(0), int64(0), int64(0), item.Status, item.Spec)
+		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colResumable, colOwnerLeaseExpiryAt, colStatus, colSpec}).
+			AddRow(item.ID, item.TenantID, item.Expiry, &tags, "", int64(0), int64(0), int64(0), false, nil, item.Status, item.Spec)
 
 		mock.ExpectQuery("SELECT .+ FROM "+testTable+" WHERE .+NOT IN").
 			WithArgs(testTenantID, 0, 11).
@@ -315,8 +322,8 @@ func TestBatchGet(t *testing.T) {
 		item := newTestBatchItem("batch-1", testTenantID)
 		tags, _ := packTags(item.Tags)
 
-		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colStatus, colSpec}).
-			AddRow(item.ID, item.TenantID, item.Expiry, &tags, "", int64(0), int64(0), int64(0), item.Status, item.Spec)
+		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colResumable, colOwnerLeaseExpiryAt, colStatus, colSpec}).
+			AddRow(item.ID, item.TenantID, item.Expiry, &tags, "", int64(0), int64(0), int64(0), false, nil, item.Status, item.Spec)
 
 		mock.ExpectQuery("SELECT .+ FROM "+testTable+" WHERE").
 			WithArgs(pgxmock.AnyArg(), 0, 11).
@@ -400,6 +407,40 @@ func TestBatchUpdate(t *testing.T) {
 		}
 	})
 
+	t.Run("resumable precondition is included", func(t *testing.T) {
+		client, mock := newTestBatchClient(t)
+		defer mock.Close()
+
+		item := newTestBatchItem("batch-1", testTenantID)
+		expectedResumable := false
+		item.ExpectedResumable = &expectedResumable
+
+		mock.ExpectExec("UPDATE "+testTable+" SET.*resumable = \\$4").
+			WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), "batch-1", false).
+			WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+
+		err := client.DBUpdate(ctx, item, nil)
+		if !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("expected ErrConflict, got %v", err)
+		}
+	})
+
+	t.Run("epoch zero is fenced when bumped", func(t *testing.T) {
+		client, mock := newTestBatchClient(t)
+		defer mock.Close()
+
+		item := newTestBatchItem("batch-1", testTenantID)
+		item.BumpEpoch = true
+
+		mock.ExpectExec("UPDATE "+testTable+" SET.*epoch = epoch \\+ 1.*epoch = \\$4").
+			WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), "batch-1", int64(0)).
+			WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+
+		if err := client.DBUpdate(ctx, item, nil); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+	})
+
 	t.Run("returns error for nil item", func(t *testing.T) {
 		client, mock := newTestBatchClient(t)
 		defer mock.Close()
@@ -435,6 +476,74 @@ func TestBatchDelete(t *testing.T) {
 
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+}
+
+func TestBatchUpdateProgress(t *testing.T) {
+	ctx := context.Background()
+	countsJSON := []byte(`{"total":10,"completed":7,"failed":3,"retried":2}`)
+
+	t.Run("updates progress counts using jsonb_set", func(t *testing.T) {
+		client, mock := newTestBatchClient(t)
+		defer mock.Close()
+
+		mock.ExpectExec("UPDATE "+testTable+" SET status = jsonb_set").
+			WithArgs(string(countsJSON), "batch-1", int64(5)).
+			WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+
+		err := client.DBUpdateProgress(ctx, "batch-1", 5, countsJSON)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("SQL carries the epoch fence", func(t *testing.T) {
+		client, mock := newTestBatchClient(t)
+		defer mock.Close()
+
+		mock.ExpectExec("UPDATE "+testTable+".*epoch = \\$3").
+			WithArgs(pgxmock.AnyArg(), "batch-1", int64(7)).
+			WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+
+		err := client.DBUpdateProgress(ctx, "batch-1", 7, countsJSON)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("stale epoch write surfaces ErrConflict", func(t *testing.T) {
+		client, mock := newTestBatchClient(t)
+		defer mock.Close()
+
+		// Fence mismatch: the UPDATE matches no rows. The fenced-out writer must
+		// learn it lost ownership, so the write surfaces ErrConflict.
+		mock.ExpectExec("UPDATE "+testTable+".*epoch = \\$3").
+			WithArgs(pgxmock.AnyArg(), "batch-1", int64(4)).
+			WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+
+		err := client.DBUpdateProgress(ctx, "batch-1", 4, countsJSON)
+		if !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("stale-epoch write must surface ErrConflict, got %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("returns error for empty ID", func(t *testing.T) {
+		client, mock := newTestBatchClient(t)
+		defer mock.Close()
+
+		err := client.DBUpdateProgress(ctx, "", 1, countsJSON)
+		if err == nil {
+			t.Fatal("expected error for empty ID")
 		}
 	})
 }

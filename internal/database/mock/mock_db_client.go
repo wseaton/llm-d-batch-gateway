@@ -20,8 +20,10 @@ package mock
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"sync"
 	"time"
 
@@ -100,6 +102,27 @@ func (m *MockDBClient[T, Q]) DBGet(
 			}
 			return true
 		})
+
+		// Order by ID like the real database (sync.Map iteration order is random).
+		sort.Slice(allMatches, func(i, j int) bool {
+			if bq.Descending {
+				return m.idGetter(allMatches[i]) > m.idGetter(allMatches[j])
+			}
+			return m.idGetter(allMatches[i]) < m.idGetter(allMatches[j])
+		})
+
+		// Keyset cursor: keep only items strictly after AfterID; it replaces the offset.
+		if bq.AfterID != "" {
+			start = 0
+			kept := allMatches[:0]
+			for _, item := range allMatches {
+				id := m.idGetter(item)
+				if (!bq.Descending && id > bq.AfterID) || (bq.Descending && id < bq.AfterID) {
+					kept = append(kept, item)
+				}
+			}
+			allMatches = kept
+		}
 	}
 
 	// Handle pagination
@@ -151,10 +174,26 @@ func (m *MockDBClient[T, Q]) DBUpdate(ctx context.Context, item *T, expectedStat
 		// Epoch fencing: if the update item has Epoch > 0, check it matches.
 		updateVal := reflect.ValueOf(*item)
 		epochField := updateVal.FieldByName("Epoch")
-		if epochField.IsValid() && epochField.Kind() == reflect.Int64 && epochField.Int() > 0 {
+		bumpEpochField := updateVal.FieldByName("BumpEpoch")
+		bumpEpoch := bumpEpochField.IsValid() && bumpEpochField.Kind() == reflect.Bool && bumpEpochField.Bool()
+		if epochField.IsValid() && epochField.Kind() == reflect.Int64 && (epochField.Int() > 0 || bumpEpoch) {
 			existingEpoch := val.FieldByName("Epoch")
 			if existingEpoch.IsValid() && existingEpoch.Int() != epochField.Int() {
 				return fmt.Errorf("DBUpdate: %w", api.ErrConflict)
+			}
+		}
+
+		expectedResumableField := updateVal.FieldByName("ExpectedResumable")
+		if expectedResumableField.IsValid() && expectedResumableField.Kind() == reflect.Pointer && !expectedResumableField.IsNil() {
+			existingResumable := val.FieldByName("Resumable")
+			if existingResumable.IsValid() && existingResumable.Kind() == reflect.Bool {
+				if existingResumable.Bool() != expectedResumableField.Elem().Bool() {
+					return fmt.Errorf("DBUpdate: %w", api.ErrConflict)
+				}
+				// Postgres uses resumable only as a WHERE condition — a status
+				// write never changes the column. The item replacement below
+				// must not drop it, or a later fenced write would conflict.
+				reflect.ValueOf(item).Elem().FieldByName("Resumable").SetBool(existingResumable.Bool())
 			}
 		}
 	}
@@ -170,6 +209,53 @@ func (m *MockDBClient[T, Q]) DBDelete(ctx context.Context, ids []string) (delete
 		}
 	}
 	return
+}
+
+func (m *MockDBClient[T, Q]) DBUpdateProgress(ctx context.Context, id string, epoch int64, countsJSON []byte) error {
+	if id == "" {
+		return fmt.Errorf("DBUpdateProgress: empty ID")
+	}
+	existing, ok := m.items.Load(id)
+	if !ok {
+		return fmt.Errorf("cannot update progress for ID '%s': item doesn't exist", id)
+	}
+
+	if existingItem, ok := existing.(*T); ok {
+		// Copy-on-write: the map is thread-safe but the items are not, so the
+		// merged status is published via Store on a shallow copy. SetBytes
+		// swaps the slice header, leaving the previously stored item stable
+		// for readers that loaded it concurrently.
+		item := *existingItem
+		val := reflect.ValueOf(&item).Elem()
+		// Mirror the Postgres epoch fence: items with an Epoch field are only
+		// updated when the caller carries the current epoch; a stale-epoch write
+		// matches no rows, so surface ErrConflict to the caller.
+		if epochField := val.FieldByName("Epoch"); epochField.IsValid() && epochField.Kind() == reflect.Int64 && epochField.Int() != epoch {
+			return fmt.Errorf("DBUpdateProgress: %w", api.ErrConflict)
+		}
+		statusField := val.FieldByName("Status")
+		if statusField.IsValid() && statusField.CanSet() && statusField.Kind() == reflect.Slice {
+			currentStatus, _ := statusField.Interface().([]byte)
+			var statusMap map[string]any
+			if len(currentStatus) > 0 {
+				_ = json.Unmarshal(currentStatus, &statusMap)
+			}
+			if statusMap == nil {
+				statusMap = make(map[string]any)
+			}
+			if !json.Valid(countsJSON) {
+				return fmt.Errorf("DBUpdateProgress: invalid request counts JSON")
+			}
+			statusMap["request_counts"] = json.RawMessage(countsJSON)
+			newStatus, err := json.Marshal(statusMap)
+			if err != nil {
+				return fmt.Errorf("DBUpdateProgress: marshal status: %w", err)
+			}
+			statusField.SetBytes(newStatus)
+		}
+		m.items.Store(id, &item)
+	}
+	return nil
 }
 
 func (m *MockDBClient[T, Q]) GetContext(parentCtx context.Context, timeLimit time.Duration) (context.Context, context.CancelFunc) {

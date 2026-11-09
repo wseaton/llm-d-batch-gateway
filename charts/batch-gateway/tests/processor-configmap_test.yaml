@@ -12,9 +12,56 @@ tests:
       - notMatchRegex:
           path: data["config.yaml"]
           pattern: 'model_gateways:'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'dispatch_mode: "sync"'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'max_connections: 8'
+
+  - it: should render shared extra endpoints
+    set:
+      global.extraEndpoints:
+        - /v1/classify
+        - /v1/pooling
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'extra_endpoints:\n\s+- "/v1/classify"\n\s+- "/v1/pooling"'
+
+  - it: should prefer processor extra endpoints over the global value
+    set:
+      global.extraEndpoints:
+        - /v1/global
+      processor.config.extraEndpoints:
+        - /v1/processor
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'extra_endpoints:\n\s+- "/v1/processor"'
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: '/v1/global'
+
+  - it: should allow processor extra endpoints to explicitly override global with empty
+    set:
+      global.extraEndpoints:
+        - /v1/global
+      processor.config.extraEndpoints: []
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: "extra_endpoints:"
+
+  - it: should omit extra endpoints by default
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: "extra_endpoints:"
 
   - it: should default tls_insecure_skip_verify to false when omitted from global_inference_gateway
     set:
+      processor.config.dispatchMode: sync
       processor.config.globalInferenceGateway:
         url: "http://global-gw:8000"
         requestTimeout: "5m"
@@ -29,6 +76,7 @@ tests:
 
   - it: should default tls_insecure_skip_verify to false when omitted from model gateway
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://gw:8000"
@@ -43,6 +91,7 @@ tests:
 
   - it: should render global_inference_gateway when set
     set:
+      processor.config.dispatchMode: sync
       processor.config.globalInferenceGateway:
         url: "http://global-gw:8000"
         requestTimeout: "5m"
@@ -57,6 +106,9 @@ tests:
           pattern: 'global_inference_gateway:'
       - matchRegex:
           path: data["config.yaml"]
+          pattern: 'dispatch_mode: "sync"'
+      - matchRegex:
+          path: data["config.yaml"]
           pattern: 'url: "http://global-gw:8000"'
       - notMatchRegex:
           path: data["config.yaml"]
@@ -64,6 +116,7 @@ tests:
 
   - it: should render global_inference_gateway optional fields only when set
     set:
+      processor.config.dispatchMode: sync
       processor.config.globalInferenceGateway:
         url: "http://global-gw:8000"
         requestTimeout: "5m"
@@ -108,6 +161,26 @@ tests:
           path: data["config.yaml"]
           pattern: 'aimd:\n\s+enabled: true\n\s+min: 5\n\s+backoff_factor: 0.5\n\s+additive_increase: 1'
 
+  - it: should render the input-file disk budget configuration
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'work_dir_size_limit: "10Gi"'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'input_file_disk_budget_percent: 10'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'input_file_max_size_bytes: 209715200'
+
+  - it: should use the global maximum input-file size
+    set:
+      global.maxInputFileSizeBytes: 524288000
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'input_file_max_size_bytes: 524288000'
+
   - it: should render custom concurrency values
     set:
       processor.config.concurrency:
@@ -135,6 +208,7 @@ tests:
 
   - it: should render per-model gateway entries
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://llama-gw:8000"
@@ -156,6 +230,9 @@ tests:
           pattern: '"llama-3":'
       - matchRegex:
           path: data["config.yaml"]
+          pattern: 'dispatch_mode: "sync"'
+      - matchRegex:
+          path: data["config.yaml"]
           pattern: 'url: "http://llama-gw:8000"'
       - matchRegex:
           path: data["config.yaml"]
@@ -169,6 +246,7 @@ tests:
 
   - it: should not contain stale model entries when a model is removed
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://gw:8000"
@@ -187,6 +265,7 @@ tests:
 
   - it: should render explicit zero maxRetries as 0 in model_gateways
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://gw:8000"
@@ -202,6 +281,7 @@ tests:
 
   - it: should render apiKeyName only when set
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://gw:8000"
@@ -224,6 +304,7 @@ tests:
 
   - it: should render TLS fields only when set
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://gw:8000"
@@ -281,16 +362,17 @@ tests:
 
   - it: should render per-model inferenceObjective when set
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
-          url: "http://gie-a-epp:8081"
+          url: "http://epp-a:8081"
           inferenceObjective: "batch-sheddable-a"
           requestTimeout: "5m"
           maxRetries: 3
           initialBackoff: "1s"
           maxBackoff: "60s"
         "mistral":
-          url: "http://gie-b-epp:8081"
+          url: "http://epp-b:8081"
           inferenceObjective: "batch-sheddable-b"
           requestTimeout: "2m"
           maxRetries: 1
@@ -306,6 +388,7 @@ tests:
 
   - it: should not render per-model inferenceObjective when empty
     set:
+      processor.config.dispatchMode: sync
       processor.config.modelGateways:
         "llama-3":
           url: "http://gw:8000"
@@ -323,6 +406,7 @@ tests:
 
   - it: should render inferenceObjective on global_inference_gateway when set
     set:
+      processor.config.dispatchMode: sync
       processor.config.globalInferenceGateway:
         url: "http://global-gw:8000"
         inferenceObjective: "batch-sheddable-global"
@@ -338,6 +422,7 @@ tests:
 
   - it: should not render inferenceObjective on global_inference_gateway when empty
     set:
+      processor.config.dispatchMode: sync
       processor.config.globalInferenceGateway:
         url: "http://global-gw:8000"
         requestTimeout: "5m"
@@ -373,6 +458,53 @@ tests:
       - matchRegex:
           path: data["config.yaml"]
           pattern: '"sim-model-inject":[\s\S]*inference_pool_name: "sim-pool-inject"'
+
+  - it: should render SQL async transport settings
+    set:
+      processor.config.dispatchMode: async
+      processor.config.asyncDispatch:
+        transport: sql
+        resultPollTimeout: "30s"
+        pollInterval: "2s"
+        maxConnections: 12
+        models:
+          "sim-model":
+            inferencePoolName: "sim-pool"
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'async_dispatch:[\s\S]*transport: "sql"[\s\S]*poll_interval: "2s"[\s\S]*max_connections: 12'
+  - it: should preserve an explicit zero max connections value
+    set:
+      processor.config.dispatchMode: async
+      processor.config.asyncDispatch:
+        transport: sql
+        resultPollTimeout: "30s"
+        pollInterval: "2s"
+        maxConnections: 0
+        models:
+          "sim-model":
+            inferencePoolName: "sim-pool"
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'async_dispatch:[\s\S]*max_connections: 0'
+  - it: should render resumable tunables with defaults
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'resumable:[\s\S]*lease_duration: "5m"[\s\S]*finalize_concurrency: 16[\s\S]*finalize_timeout: "30m"'
+
+  - it: should render resumable tunables when overridden
+    set:
+      processor.config.resumable:
+        leaseDuration: "2m"
+        finalizeConcurrency: 8
+        finalizeTimeout: "10m"
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'resumable:[\s\S]*lease_duration: "2m"[\s\S]*finalize_concurrency: 8[\s\S]*finalize_timeout: "10m"'
 
   - it: should not render send_fairness_header when false (default)
     asserts:
