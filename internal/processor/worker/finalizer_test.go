@@ -765,3 +765,97 @@ func TestUploadPartialResults_UploadsFilesInParallel(t *testing.T) {
 		t.Errorf("expected peak concurrency >= 2, got %d (uploads ran sequentially)", peak)
 	}
 }
+
+// TestFinalizeJob_FinalizingConflict covers the finalizing write meeting a row
+// that changed after the last progress tick, with no cancel event delivered.
+func TestFinalizeJob_FinalizingConflict(t *testing.T) {
+	const (
+		jobID    = "job-finalizing-conflict"
+		tenantID = "tenant-1"
+		epoch    = int64(4)
+	)
+	tests := []struct {
+		name       string
+		rowStatus  openai.BatchStatus
+		rowEpoch   int64
+		wantErr    error
+		wantStatus openai.BatchStatus
+		wantUpload bool
+	}{
+		{
+			name:       "cancelling row finalizes as cancelled with the output uploaded",
+			rowStatus:  openai.BatchStatusCancelling,
+			rowEpoch:   epoch,
+			wantErr:    batchctx.ErrCancelled,
+			wantStatus: openai.BatchStatusCancelled,
+			wantUpload: true,
+		},
+		{
+			name:       "reclaimed row is left to the new owner",
+			rowStatus:  openai.BatchStatusInProgress,
+			rowEpoch:   epoch + 1,
+			wantErr:    db.ErrConflict,
+			wantStatus: openai.BatchStatusInProgress,
+		},
+		{
+			name:       "terminal row is left alone",
+			rowStatus:  openai.BatchStatusFailed,
+			rowEpoch:   epoch,
+			wantErr:    db.ErrConflict,
+			wantStatus: openai.BatchStatusFailed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := testLoggerCtx(t)
+			cfg := config.NewConfig()
+			cfg.WorkDir = t.TempDir()
+
+			dbClient := newMockBatchDBClient()
+			if err := dbClient.DBStore(ctx, &db.BatchItem{
+				BaseIndexes:  db.BaseIndexes{ID: jobID, TenantID: tenantID, Tags: db.Tags{}},
+				BaseContents: db.BaseContents{Status: mustJSON(t, openai.BatchStatusInfo{Status: tt.rowStatus})},
+				Epoch:        tt.rowEpoch,
+			}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			files := &failNTimesFilesClient{}
+			p := mustNewProcessor(t, cfg, &clientset.Clientset{
+				BatchDB: dbClient,
+				FileDB:  newMockFileDBClient(),
+				File:    files,
+				Queue:   mockdb.NewMockBatchPriorityQueueClient(),
+			})
+			jobInfo := setupJobWithOutputFile(t, cfg, jobID, tenantID)
+			owner := &db.BatchItem{
+				BaseIndexes:  db.BaseIndexes{ID: jobID, TenantID: tenantID, Tags: db.Tags{}},
+				BaseContents: db.BaseContents{Status: mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusInProgress})},
+				Epoch:        epoch,
+			}
+			counts := &openai.BatchRequestCounts{Total: 1, Completed: 1}
+
+			err := p.finalizeJob(ctx, NewStatusUpdater(dbClient), owner, jobInfo, counts)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("finalizeJob() error = %v, want %v", err, tt.wantErr)
+			}
+			assertJobStatus(t, dbClient, jobID, tt.wantStatus)
+			if uploaded := files.calls > 0; uploaded != tt.wantUpload {
+				t.Fatalf("uploaded = %v, want %v", uploaded, tt.wantUpload)
+			}
+			if tt.wantUpload {
+				items, _, _, err := dbClient.DBGet(ctx, &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)
+				if err != nil || len(items) != 1 {
+					t.Fatalf("DBGet: err=%v len=%d", err, len(items))
+				}
+				var info openai.BatchStatusInfo
+				if err := json.Unmarshal(items[0].Status, &info); err != nil {
+					t.Fatalf("unmarshal status: %v", err)
+				}
+				if info.OutputFileID == nil || *info.OutputFileID == "" {
+					t.Fatal("cancelled status has no output_file_id")
+				}
+			}
+		})
+	}
+}

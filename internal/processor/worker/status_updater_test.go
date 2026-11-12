@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -303,4 +304,92 @@ func TestUpdatePersistentStatus_PreservesPriorTimestamps(t *testing.T) {
 			}
 		})
 	}
+}
+
+var allBatchStatuses = []openai.BatchStatus{
+	openai.BatchStatusValidating,
+	openai.BatchStatusInProgress,
+	openai.BatchStatusFinalizing,
+	openai.BatchStatusCancelling,
+	openai.BatchStatusCompleted,
+	openai.BatchStatusFailed,
+	openai.BatchStatusExpired,
+	openai.BatchStatusCancelled,
+}
+
+var nonTerminalBatchStatuses = []openai.BatchStatus{
+	openai.BatchStatusValidating,
+	openai.BatchStatusInProgress,
+	openai.BatchStatusFinalizing,
+	openai.BatchStatusCancelling,
+}
+
+// processorWrites lists every status the processor writes and the stored
+// statuses it may write it over.
+var processorWrites = []struct {
+	next openai.BatchStatus
+	from []openai.BatchStatus
+}{
+	{next: openai.BatchStatusValidating, from: []openai.BatchStatus{openai.BatchStatusInProgress}},
+	{next: openai.BatchStatusInProgress, from: []openai.BatchStatus{openai.BatchStatusValidating}},
+	{next: openai.BatchStatusFinalizing, from: []openai.BatchStatus{openai.BatchStatusInProgress}},
+	{next: openai.BatchStatusCompleted, from: []openai.BatchStatus{openai.BatchStatusFinalizing}},
+	{next: openai.BatchStatusFailed, from: nonTerminalBatchStatuses},
+	{next: openai.BatchStatusExpired, from: nonTerminalBatchStatuses},
+	{next: openai.BatchStatusCancelled, from: nonTerminalBatchStatuses},
+}
+
+// testProcessorTransitions writes every processor status over every stored
+// status. The owner's in-memory copy predates a progress write, so only the
+// lifecycle status may decide the outcome.
+func testProcessorTransitions(t *testing.T, batchDB db.BatchProgressDBClient, idPrefix string) {
+	t.Helper()
+	ctx := context.Background()
+	const epoch = int64(3)
+	for _, w := range processorWrites {
+		for _, current := range allBatchStatuses {
+			t.Run(fmt.Sprintf("%s over %s", w.next, current), func(t *testing.T) {
+				id := fmt.Sprintf("%s-%s-over-%s", idPrefix, w.next, current)
+				if _, err := batchDB.DBDelete(ctx, []string{id}); err != nil {
+					t.Fatalf("delete: %v", err)
+				}
+				t.Cleanup(func() { _, _ = batchDB.DBDelete(context.Background(), []string{id}) })
+				if err := batchDB.DBStore(ctx, &db.BatchItem{
+					BaseIndexes: db.BaseIndexes{ID: id, TenantID: "tenant-1"},
+					BaseContents: db.BaseContents{Status: mustJSON(t, openai.BatchStatusInfo{
+						Status:        current,
+						RequestCounts: openai.BatchRequestCounts{Total: 4, Completed: 2},
+					})},
+					Epoch: epoch,
+				}); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+				owner := &db.BatchItem{
+					BaseIndexes:  db.BaseIndexes{ID: id, TenantID: "tenant-1"},
+					BaseContents: db.BaseContents{Status: mustJSON(t, openai.BatchStatusInfo{Status: current})},
+					Epoch:        epoch,
+				}
+
+				slo := time.Now().Add(time.Hour)
+				err := NewStatusUpdater(batchDB).UpdatePersistentStatus(ctx, owner, w.next, nil, &slo)
+
+				allowed := slices.Contains(w.from, current)
+				switch {
+				case allowed && err != nil:
+					t.Fatalf("UpdatePersistentStatus() error = %v, want nil", err)
+				case !allowed && !errors.Is(err, db.ErrConflict):
+					t.Fatalf("UpdatePersistentStatus() error = %v, want db.ErrConflict", err)
+				}
+				want := current
+				if allowed {
+					want = w.next
+				}
+				assertJobStatus(t, batchDB, id, want)
+			})
+		}
+	}
+}
+
+func TestUpdatePersistentStatus_TransitionSources(t *testing.T) {
+	testProcessorTransitions(t, newMockBatchDBClient(), "job")
 }

@@ -186,6 +186,9 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 
 	// transition to in_progress before executing requests
 	if err := params.updater.UpdatePersistentStatus(ctx, params.jobItem, openai.BatchStatusInProgress, nil, nil); err != nil {
+		if errors.Is(err, db.ErrConflict) && p.resolveTransitionConflict(ctx, params) {
+			return
+		}
 		logger.Error(err, "Failed to update status to in_progress")
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "status transition failed")
@@ -241,6 +244,11 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 			metrics.RecordCancellation(metrics.CancelPhaseFinalizing)
 			metrics.RecordJobProcessed(metrics.ResultSuccess, metrics.ReasonNone)
 			logger.V(logging.INFO).Info("Job cancelled during finalization")
+			return
+		}
+		if errors.Is(err, db.ErrConflict) {
+			p.handleOwnershipLost(ctx, params)
+			metrics.RecordJobProcessingDuration(time.Since(jobStart), metrics.GetSizeBucket(int(requestCounts.Total)))
 			return
 		}
 		logger.Error(err, "Failed to finalize job")
@@ -507,6 +515,24 @@ func (p *Processor) handleOwnershipLost(ctx context.Context, params *jobExecutio
 	p.cleanupJobArtifacts(ioCtx, params.jobItem.ID, params.jobItem.TenantID)
 
 	metrics.RecordJobProcessed(metrics.ResultLostOwnership, metrics.ReasonNone)
+}
+
+// resolveTransitionConflict handles a status write that found the job's row in
+// an unexpected state. A cancelling row is finalized as cancelled and a row
+// this processor no longer owns is dropped without a terminal write. It
+// returns false when the row's state could not be read, leaving the failure
+// to the caller.
+func (p *Processor) resolveTransitionConflict(ctx context.Context, params *jobExecutionParams) bool {
+	status, err := params.updater.CheckJobStatus(ctx, params.jobItem.ID, params.jobItem.Epoch)
+	switch {
+	case errors.Is(err, db.ErrConflict):
+		p.handleOwnershipLost(ctx, params)
+		return true
+	case err == nil && status == openai.BatchStatusCancelling:
+		p.handleJobError(ctx, params, batchctx.ErrCancelled)
+		return true
+	}
+	return false
 }
 
 // recordE2ELatency records the full lifecycle duration from batch submission to terminal state.

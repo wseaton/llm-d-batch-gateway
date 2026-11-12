@@ -149,8 +149,30 @@ func (m *MockDBClient[T, Q]) DBUpdate(ctx context.Context, item *T, expectedStat
 			}
 		}
 
-		// Epoch fencing: if the update item has Epoch > 0, check it matches.
 		updateVal := reflect.ValueOf(*item)
+
+		// Lifecycle CAS: the current status.status must be one of ExpectedStatuses.
+		if expected := updateVal.FieldByName("ExpectedStatuses"); expected.IsValid() && expected.Kind() == reflect.Slice && expected.Len() > 0 {
+			currentStatus, _ := val.FieldByName("Status").Interface().([]byte)
+			var current struct {
+				Status string `json:"status"`
+			}
+			if err := json.Unmarshal(currentStatus, &current); err != nil {
+				return fmt.Errorf("DBUpdate: unmarshal current status: %w", err)
+			}
+			matched := false
+			for i := range expected.Len() {
+				if expected.Index(i).String() == current.Status {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return fmt.Errorf("DBUpdate: %w", api.ErrConflict)
+			}
+		}
+
+		// Epoch fencing: if the update item has Epoch > 0, check it matches.
 		epochField := updateVal.FieldByName("Epoch")
 		if epochField.IsValid() && epochField.Kind() == reflect.Int64 && epochField.Int() > 0 {
 			existingEpoch := val.FieldByName("Epoch")
